@@ -10,7 +10,7 @@ from desc.backend import tree_flatten, tree_leaves, tree_map, tree_unflatten
 from desc.batching import vmap_chunked
 from desc.compute import get_profiles, get_transforms
 from desc.compute.utils import _compute as compute_fun
-from desc.grid import LinearGrid, _Grid
+from desc.grid import LinearGrid, QuadratureGrid, _Grid
 from desc.integrals import compute_B_plasma
 from desc.utils import (
     Timer,
@@ -1983,6 +1983,774 @@ class SurfaceQuadraticFlux(_Objective):
         B_ext = jnp.sum(B_ext * eval_data["n_rho"], axis=-1)
         f = B_ext * jnp.sqrt(eval_data["|e_theta x e_zeta|"])
         return f
+
+
+# NEW BXDL CODE
+# Summary of errors run into while incorporating this in:
+# (1) Some import errors - placed  "from desc.grid import  QuadratureGrid" in build(...)
+# and "from desc.utils import cross" in compute(...)
+# (2) Implemented _static_attrs
+# (3) TracerBoolConversionError.
+
+
+class Bxdl(_Objective):
+    """Target Bxdl = 0 on a curve.
+
+    Computes field from MagneticField object(s), and optimizes them to produce a field
+    which is parallel relative to a given Curve object.
+
+    Parameters
+    ----------
+    curve : Curve
+        Curve along which magnetic field will be optimized.
+    field : MagneticField
+        External field produced by coils or other source, which will be optimized to
+        minimize the perpendicular component to the Curve.
+    eq : Equilibrium, optional
+        Equilibrium to compute the B_plasma contribution from at the curve.
+    eq_grid : Grid, optional
+        Collocation grid containing the nodes in the equilibrium to compute the plasma
+        magnetic field from.
+        Default grid is: ``QuadratureGrid(L=2*eq.L_grid, M=2*eq.M_grid, N=2 *
+        eq.N_grid, NFP=eq.NFP)``
+    eval_grid : Grid, optional
+        Collocation grid for the points to evaluate the objective at on the curve.
+        Default grid is determined by the Curve object.
+    field_grid : Grid, optional
+        Grid used to discretize field (e.g. grid for the magnetic field source from
+        coils). Default grid is determined by the specific MagneticField object, see
+        the docs of that object's ``compute_magnetic_field`` method for more detail.
+    bs_chunk_size : int or None
+        Size to split Biot-Savart computation into chunks of evaluation points.
+        If no chunking should be done or the chunk size is the full input
+        then supply ``None``.
+    field_fixed : bool, optional
+        Whether to fix the field's DOFs during the optimization. Default is False.
+    curve_fixed : bool, optional
+        Whether to fix the curve's DOFs during the optimization. Default is True.
+    eq_kwargs : dict, optional
+        Additional keyword arguments to pass to the equilibrium's
+        ``compute_magnetic_field`` method.
+    eq_fixed : bool, optional
+        True if the equilibrium is fixed in the optimization. Default is True.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.",
+        bounds_default="``target=0``.",
+    )
+
+    _scalar = False
+    _linear = False
+    _print_value_fmt = "Curve Bxdl error: "
+    _units = "(T)"
+    _coordinates = "rtz"
+
+    _static_attrs = _Objective._static_attrs + [
+        "_bs_chunk_size",
+        "_field_fixed",
+        "_curve_fixed",
+        "_eq_fixed",
+    ]
+
+    def __init__(
+        self,
+        curve,
+        field,
+        eq=None,
+        eq_grid=None,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        eval_grid=None,
+        field_grid=None,
+        name="Bxdl",
+        jac_chunk_size=None,
+        *,
+        bs_chunk_size=None,
+        eq_kwargs={},
+        field_fixed=False,
+        curve_fixed=True,
+        eq_fixed=True,
+        **kwargs,
+    ):
+
+        if target is None and bounds is None:
+            target = 0
+
+        self._eval_grid = eval_grid
+        self._curve = curve
+        self._field = [field] if not isinstance(field, list) else field
+        self._field_grid = field_grid
+        self._eq = eq
+        self._eq_grid = eq_grid
+        self._bs_chunk_size = bs_chunk_size
+        self._eq_kwargs = eq_kwargs
+        things = []
+        self._field_fixed = field_fixed
+        self._curve_fixed = curve_fixed
+        self._eq_fixed = eq_fixed
+
+        if not field_fixed:
+            things += self._field
+        if not curve_fixed:
+            things += [self._curve]
+        if not eq_fixed and eq is not None:
+            things += [self._eq]
+
+        errorif(
+            curve_fixed and eq_fixed and field_fixed,
+            ValueError,
+            "Cannot have all `curve_fixed`, `eq_fixed` and `field_fixed` set to True. "
+            "At least one of them must be False.",
+        )
+
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        from desc.grid import QuadratureGrid
+        from desc.magnetic_fields import SumMagneticField
+
+        curve = self._curve
+
+        if self._eval_grid is None:
+            eval_grid = LinearGrid(N=2 * curve.N + 5)
+            self._eval_grid = eval_grid
+        else:
+            eval_grid = self._eval_grid
+
+        self._data_keys = ["R", "Z", "phi", "ds", "frenet_tangent"]
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+        if self._curve_fixed:
+            eval_data = curve.compute(self._data_keys, grid=eval_grid, basis="rpz")
+        else:
+            eval_data = curve.compute("ds", grid=eval_grid, basis="rpz")
+        self._dim_f = eval_grid.num_nodes
+        w = eval_data["ds"]
+
+        eq = self._eq
+        B_plasma = None
+        if self._eq is not None:
+            if self._eq_grid is None:
+                eq_grid = QuadratureGrid(
+                    L=2 * eq.L_grid, M=2 * eq.M_grid, N=2 * eq.N_grid, NFP=eq.NFP
+                )
+            else:
+                eq_grid = self._eq_grid
+            eq_data_keys = ["J", "phi", "sqrt(g)", "x"]
+            transforms = get_transforms(eq_data_keys, obj=eq, grid=eq_grid)
+            if self._eq_fixed and self._curve_fixed:
+                x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
+                B_plasma = eq.compute_magnetic_field(
+                    coords=x,
+                    chunk_size=self._bs_chunk_size,
+                    source_grid=eq_grid,
+                    basis="rpz",
+                    transforms=transforms,
+                    **self._eq_kwargs,
+                )
+        else:
+            eq_grid = None
+            transforms = None
+
+        self._constants = {
+            "field": SumMagneticField(self._field),
+            "field_grid": self._field_grid,
+            "quad_weights": w,
+            "eval_data": eval_data,
+            "B_plasma": B_plasma,
+            "eq_transforms": transforms,
+            "eq_grid": eq_grid,
+        }
+
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        if self._normalize and self._eq is not None:
+            scales = compute_scaling_factors(eq)
+            self._normalization = scales["B"]  # assume field of same scale as eq
+        elif self._normalize and self._eq is None:
+            self._normalization = 1
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, *params, constants=None):
+        """Compute Bxdl error on curve.
+
+        Parameters
+        ----------
+        field_params : dict
+            Dictionary of the external field's and/or the curve's and/or the
+            equilibrium's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants
+
+        Returns
+        -------
+        f : ndarray
+            Bxdl error at points
+
+        """
+        from desc.utils import cross
+
+        # Use an index to track the end of the main parameters
+        end_index = len(params)
+
+        # Conditionally extract items from the end of the tuple
+        if not self._eq_fixed:
+            eq_params = params[end_index - 1]
+            end_index -= 1
+        if not self._curve_fixed:
+            curve_params = params[end_index - 1]
+            end_index -= 1
+        if not self._field_fixed:
+            field_params = params[:end_index]
+
+        if constants is None:
+            constants = self.constants
+        if self._curve_fixed:
+            eval_data = constants["eval_data"]
+        else:
+            eval_data = self._curve.compute(
+                self._data_keys, grid=self._eval_grid, basis="rpz", params=curve_params
+            )
+        x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
+
+        # B_ext is not pre-computed because field is not fixed typically
+
+        B_ext = constants["field"].compute_magnetic_field(
+            x,
+            source_grid=constants["field_grid"],
+            basis="rpz",
+            params=field_params if not self._field_fixed else None,
+            chunk_size=self._bs_chunk_size,
+        )
+        if constants["B_plasma"] is not None:
+            B_ext = B_ext + constants["B_plasma"]
+        elif self._eq is not None:
+            eq = self._eq
+            x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
+            eq_grid = constants["eq_grid"]
+            B_plasma = eq.compute_magnetic_field(
+                coords=x,
+                chunk_size=self._bs_chunk_size,
+                source_grid=eq_grid,
+                params=eq_params if not self._eq_fixed else None,
+                basis="rpz",
+                transforms=constants["eq_transforms"],
+                **self._eq_kwargs,
+            )
+            B_ext = B_ext + B_plasma
+        f = safenorm(cross(B_ext, eval_data["frenet_tangent"], axis=-1), axis=-1)
+        return f
+
+
+# NEW BXDL CODE
+
+
+# NEW Divertor legs CODE
+# From two curves (X point and a footpoint curve),
+# constructs a plane between them and computes quadrature points and normals
+# such that we can minimize B.n=0 on the plane.
+#
+# Curves with free dofs (basically a free-boundary version) is not yet tested,
+# but fixed curves works. Make one FieldNormalError objective per divertor leg.
+
+
+class FieldNormalError(_Objective):
+    """Target B*n = 0 at specific points in space.
+
+    Computes the magnetic field from coils (and optionally plasma) at user-defined
+    points and minimizes the component parallel to user-defined normal vectors.
+
+    Can be initialized in two ways:
+
+    1. **Explicit points/normals**: Supply ``points`` and ``normal_vectors`` directly.
+    2. **Two-curve ruled surface**: Supply ``curve_start`` and ``curve_end`` (DESC curve
+       objects), and the objective will auto-generate a ruled surface connecting them
+       using ``nquad`` toroidal and ``n_radial`` radial quadrature points.
+
+    Parameters
+    ----------
+    field : MagneticField
+        External field produced by coils which will be optimized.
+    points : ndarray, shape(N, 3), optional
+        Coordinates where the error is evaluated. Coordinate system set by ``basis``.
+        Required if ``curve_start``/``curve_end`` are not provided.
+    normal_vectors : ndarray, shape(N, 3), optional
+        Unit normal vectors at ``points``, in the same basis as ``points``.
+        Required if ``curve_start``/``curve_end`` are not provided.
+    curve_start : Curve, optional
+        DESC curve object defining the inner (or start) edge of the divertor surface.
+        Required if ``points``/``normal_vectors`` are not provided.
+    curve_end : Curve, optional
+        DESC curve object defining the outer (or end) edge of the divertor surface.
+        Required if ``points``/``normal_vectors`` are not provided.
+    nquad : int, optional
+        Number of toroidal quadrature points sampled along each curve when building
+        the ruled surface. Default is 128.
+    n_radial : int, optional
+        Number of radial quadrature points spanning the ruled surface from
+        ``curve_start`` to ``curve_end``. Default is 8.
+    extent : float, optional
+        Fractional extent of the ruled surface in the forward direction (toward
+        ``curve_end``). 1.0 reaches ``curve_end`` exactly. Default is 0.5.
+    min_extent : float, optional
+        Fractional extent in the backward direction (behind ``curve_start``).
+        0.0 starts exactly at ``curve_start``. Negative values extend behind it.
+        Default is 0.0.
+    eq : Equilibrium, optional
+        Equilibrium to compute the B_plasma contribution from.
+    basis : str
+        "rpz" (cylindrical) or "xyz" (Cartesian). Defines the coordinate system
+        for ``points``/``normal_vectors`` and the B-field evaluation. Default "rpz".
+    eq_grid : Grid, optional
+        Collocation grid for computing the plasma magnetic field.
+    field_grid : Grid, optional
+        Grid used to discretize the coil field source.
+    bs_chunk_size : int or None
+        Chunk size for Biot-Savart computation. None computes all at once.
+    field_fixed : bool, optional
+        Whether to fix the field's DOFs during optimization. Default False.
+    eq_fixed : bool, optional
+        True if the equilibrium is fixed during optimization. Default True.
+    eq_kwargs : dict, optional
+        Extra keyword arguments passed to ``eq.compute_magnetic_field``.
+    """
+    _static_attrs = _Objective._static_attrs + [
+        "_basis",
+        "_bs_chunk_size",
+        "_field_fixed",
+        "_eq_fixed",
+        "_curves_fixed",
+        "_n_radial",
+        "_extent",
+        "_min_extent",
+    ]
+
+    _scalar = False
+    _linear = False
+    _print_value_fmt = "Field Normal error: "
+    _units = "(T)"
+
+    def __init__(
+        self,
+        field,
+        points=None,
+        normal_vectors=None,
+        *,
+        curve_start=None,
+        curve_end=None,
+        nquad=128,
+        n_radial=8,
+        extent=0.5,
+        min_extent=0.0,
+        eq=None,
+        basis="rpz",
+        eq_grid=None,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        field_grid=None,
+        name="B*n",
+        jac_chunk_size=None,
+        bs_chunk_size=None,
+        eq_kwargs=None,
+        field_fixed=False,
+        eq_fixed=True,
+        curves_fixed=True,
+        **kwargs,
+    ):
+        if target is None and bounds is None:
+            target = 0
+
+        using_curves = curve_start is not None and curve_end is not None
+        using_points = points is not None and normal_vectors is not None
+
+        if not using_curves and not using_points:
+            raise ValueError(
+                "FieldNormalError requires either (points, normal_vectors) "
+                "or (curve_start, curve_end)."
+            )
+        if using_curves and using_points:
+            raise ValueError(
+                "Provide either (points, normal_vectors) or (curve_start, curve_end), "
+                "not both."
+            )
+
+        self._basis = basis
+        self._curve_start = curve_start
+        self._curve_end = curve_end
+        self._nquad = nquad
+        self._nquad_input = nquad
+        self._n_radial = n_radial
+        self._extent = extent
+        self._min_extent = min_extent
+        self._curves_fixed = curves_fixed
+
+        if using_points:
+            self._points = jnp.asarray(points)
+            self._normals = jnp.asarray(normal_vectors)
+            norms = jnp.linalg.norm(self._normals, axis=-1, keepdims=True)
+            self._normals = self._normals / norms
+        else:
+            # Deferred to build()
+            self._points = None
+            self._normals = None
+
+        self._field = [field] if not isinstance(field, list) else field
+        self._field_grid = field_grid
+        self._eq = eq
+        self._eq_grid = eq_grid
+        self._bs_chunk_size = bs_chunk_size
+        self._eq_kwargs = {} if eq_kwargs is None else eq_kwargs
+        self._field_fixed = field_fixed
+        self._eq_fixed = eq_fixed
+
+        things = []
+        if not field_fixed:
+            things += self._field
+        if not curves_fixed and curve_start is not None:
+            things += [self._curve_start, self._curve_end]
+        if not eq_fixed and eq is not None:
+            things += [self._eq]
+
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def _generate_surface_from_curves(self):
+        """Generate ruled surface points and unit normals from two DESC curves.
+
+        Returns
+        -------
+        points : jnp.ndarray, shape(nquad * n_radial, 3)
+            Surface evaluation points in ``self._basis`` coordinates.
+        normals : jnp.ndarray, shape(nquad * n_radial, 3)
+            Unit outward normals in ``self._basis`` coordinates.
+        """
+        import numpy as np
+
+        from desc.compute import rpz2xyz
+        
+        # Sample curve positions (DESC curves return rpz by default)
+        c_start_rpz = np.array(self._curve_start.compute("x", grid=self._nquad)["x"])
+        c_end_rpz = np.array(self._curve_end.compute("x", grid=self._nquad)["x"])
+
+        # Update nquad to actual number of grid points returned
+        # (DESC LinearGrid(N=n) produces 2*n+1 nodes, not n)
+        self._nquad = c_start_rpz.shape[0]
+
+        # Work in Cartesian for geometrically correct cross products
+        c_start = np.array(rpz2xyz(c_start_rpz))  # (nquad, 3)
+        c_end = np.array(rpz2xyz(c_end_rpz))  # (nquad, 3)
+
+        # Ruled surface:  P(u, v) = c_start(u) + v * (c_end(u) - c_start(u))
+        # u in [0, 2pi) toroidal,  v in [min_extent, extent] radial
+        v = np.linspace(self._min_extent, self._extent, self._n_radial).reshape(
+            1, -1, 1
+        )
+        r1 = c_start[:, np.newaxis, :]  # (nquad, 1, 3)
+        r2 = c_end[:, np.newaxis, :]  # (nquad, 1, 3)
+        R_vec = r2 - r1  # (nquad, 1, 3)  chord vector
+        points_xyz = r1 + v * R_vec  # (nquad, n_radial, 3)
+
+        # Surface tangents
+        Tu = np.gradient(points_xyz, axis=0)  # dP/du  toroidal
+        Tv = np.tile(R_vec, (1, self._n_radial, 1))  # dP/dv  radial
+
+        # Outward normal  n = Tu x Tv,  then normalised
+        normals_xyz = np.cross(Tu, Tv)  # (nquad, n_radial, 3)
+        mag = np.linalg.norm(normals_xyz, axis=-1, keepdims=True)
+        mag = np.where(mag < 1e-9, 1.0, mag)  # guard against zero-mag
+        normals_xyz = normals_xyz / mag
+
+        # Flatten to (N_pts, 3)
+        pts_flat = points_xyz.reshape(-1, 3)
+        nrm_flat = normals_xyz.reshape(-1, 3)
+
+        if self._basis == "rpz":
+            # Convert positions to cylindrical
+            x, y, z = pts_flat[:, 0], pts_flat[:, 1], pts_flat[:, 2]
+            R = np.sqrt(x**2 + y**2)
+            phi = np.arctan2(y, x)
+            pts_out = np.stack([R, phi, z], axis=-1)
+
+            # Rotate normal vectors into the local rpz frame at each point
+            cos_p, sin_p = np.cos(phi), np.sin(phi)
+            n_R = nrm_flat[:, 0] * cos_p + nrm_flat[:, 1] * sin_p
+            n_phi = -nrm_flat[:, 0] * sin_p + nrm_flat[:, 1] * cos_p
+            n_Z = nrm_flat[:, 2]
+            nrm_out = np.stack([n_R, n_phi, n_Z], axis=-1)
+        else:
+            pts_out = pts_flat
+            nrm_out = nrm_flat
+
+        return jnp.asarray(pts_out), jnp.asarray(nrm_out)
+
+    def build(self, use_jit=True, verbose=1):
+        """TODO: docstring."""
+        from desc.magnetic_fields import SumMagneticField
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+
+        # Generate ruled surface from curves if not supplied directly
+        if self._points is None:
+            if verbose > 0:
+                print("Generating ruled surface from curves...")
+            self._points, self._normals = self._generate_surface_from_curves()
+
+        self._dim_f = self._points.shape[0]
+
+        # Prepare equilibrium data
+        eq = self._eq
+        B_plasma = None
+        eq_grid = None
+        transforms = None
+
+        if eq is not None:
+            eq_grid = (
+                self._eq_grid
+                if self._eq_grid is not None
+                else QuadratureGrid(
+                    L=2 * eq.L_grid, M=2 * eq.M_grid, N=2 * eq.N_grid, NFP=eq.NFP
+                )
+            )
+            eq_data_keys = ["J", "phi", "sqrt(g)", "x"]
+            transforms = get_transforms(eq_data_keys, obj=eq, grid=eq_grid)
+
+            if self._eq_fixed:
+                B_plasma = eq.compute_magnetic_field(
+                    coords=self._points,
+                    chunk_size=self._bs_chunk_size,
+                    source_grid=eq_grid,
+                    basis=self._basis,
+                    transforms=transforms,
+                    **self._eq_kwargs,
+                )
+
+        self._constants = {
+            "field": SumMagneticField(self._field),
+            "field_grid": self._field_grid,
+            "B_plasma": B_plasma,
+            "eq_transforms": transforms,
+            "eq_grid": eq_grid,
+            "points": self._points,
+            "normals": self._normals,
+            "quad_weights": jnp.ones(self._points.shape[0]),
+        }
+
+        # Precompute curve transforms for differentiable surface generation
+        if not self._curves_fixed and self._curve_start is not None:
+            from desc.grid import LinearGrid as _LG
+
+            curve_grid = _LG(N=self._nquad_input)
+            curve_data_keys = ["x", "x_s"]
+            if verbose > 0:
+                print("Precomputing curve transforms (curves_fixed=False)...")
+            self._constants["curve_start_transforms"] = get_transforms(
+                curve_data_keys, obj=self._curve_start, grid=curve_grid
+            )
+            self._constants["curve_end_transforms"] = get_transforms(
+                curve_data_keys, obj=self._curve_end, grid=curve_grid
+            )
+
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        if self._normalize and eq is not None:
+            scales = compute_scaling_factors(eq)
+            self._normalization = scales["B"]
+        elif self._normalize and eq is None:
+            self._normalization = 1
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def _compute_surface_jax(self, cs_params, ce_params, constants):
+        """Compute ruled surface from curve params (JAX-differentiable).
+
+        Called during optimization when curves_fixed=False. Regenerates the
+        ruled-surface evaluation points and unit normals from the current
+        curve Fourier coefficients so that JAX can differentiate through
+        the surface geometry.
+
+        Parameters
+        ----------
+        cs_params : dict
+            Optimizable parameters for curve_start.
+        ce_params : dict
+            Optimizable parameters for curve_end.
+        constants : dict
+            Precomputed constants including curve transforms.
+
+        Returns
+        -------
+        points : jnp.ndarray, shape(N, 3)
+            Surface points in ``self._basis`` coordinates.
+        normals : jnp.ndarray, shape(N, 3)
+            Unit normal vectors in ``self._basis`` coordinates.
+        """
+        from desc.compute import rpz2xyz, rpz2xyz_vec, xyz2rpz, xyz2rpz_vec
+
+        # Evaluate curve positions and tangents from current params
+        cs_data = self._curve_start.compute(
+            ["x", "x_s"],
+            params=cs_params,
+            transforms=constants["curve_start_transforms"],
+        )
+        ce_data = self._curve_end.compute(
+            ["x", "x_s"],
+            params=ce_params,
+            transforms=constants["curve_end_transforms"],
+        )
+
+        # Curve positions and tangents in rpz (DESC default)
+        c_start_rpz = cs_data["x"]
+        c_end_rpz = ce_data["x"]
+        dc_start_rpz = cs_data["x_s"]
+        dc_end_rpz = ce_data["x_s"]
+
+        # Convert to Cartesian for geometrically correct cross products
+        c_start = rpz2xyz(c_start_rpz)
+        c_end = rpz2xyz(c_end_rpz)
+        dc_start = rpz2xyz_vec(dc_start_rpz, phi=c_start_rpz[:, 1])
+        dc_end = rpz2xyz_vec(dc_end_rpz, phi=c_end_rpz[:, 1])
+
+        # Ruled surface: P(u,v) = c_start(u) + v * [c_end(u) - c_start(u)]
+        n_radial = self._n_radial
+        extent = self._extent
+        min_extent = self._min_extent
+        v = jnp.linspace(min_extent, extent, n_radial)
+
+        R_vec = c_end - c_start
+        dR_vec = dc_end - dc_start
+
+        # Surface points  (nquad, n_radial, 3)
+        pts = c_start[:, None, :] + v[None, :, None] * R_vec[:, None, :]
+
+        # Tangent vectors (analytical, not finite-difference)
+        Tu = dc_start[:, None, :] + v[None, :, None] * dR_vec[:, None, :]
+        Tv = jnp.broadcast_to(R_vec[:, None, :], Tu.shape)
+
+        # Unit normals = Tu x Tv, normalised
+        normals = jnp.cross(Tu, Tv)
+        mag = jnp.linalg.norm(normals, axis=-1, keepdims=True)
+        normals = normals / jnp.maximum(mag, 1e-12)
+
+        # Flatten to (N_pts, 3)
+        pts_flat = pts.reshape(-1, 3)
+        nrm_flat = normals.reshape(-1, 3)
+
+        # Convert to requested coordinate basis
+        if self._basis == "rpz":
+            pts_rpz = xyz2rpz(pts_flat)
+            nrm_flat = xyz2rpz_vec(
+                nrm_flat, x=pts_flat[:, 0], y=pts_flat[:, 1]
+            )
+            pts_flat = pts_rpz
+
+        return pts_flat, nrm_flat
+
+    def compute(self, *params, constants=None):
+        """TODO: docstring."""
+        if constants is None:
+            constants = self.constants
+
+        # Split params: field first, then curves (if free), then eq (if free).
+        end_index = len(params)
+        if not self._eq_fixed and self._eq is not None:
+            eq_params = params[end_index - 1]
+            end_index -= 1
+        else:
+            eq_params = None
+
+        if not self._curves_fixed and self._curve_start is not None:
+            ce_params = params[end_index - 1]
+            end_index -= 1
+            cs_params = params[end_index - 1]
+            end_index -= 1
+        else:
+            cs_params = None
+            ce_params = None
+
+        field_params = params[:end_index] if not self._field_fixed else None
+
+        # Get surface points/normals — static when curves fixed, dynamic otherwise
+        if cs_params is not None:
+            points, normals = self._compute_surface_jax(
+                cs_params, ce_params, constants
+            )
+        else:
+            points = constants["points"]
+            normals = constants["normals"]
+
+        # Compute coil field
+        B_total = constants["field"].compute_magnetic_field(
+            coords=points,
+            source_grid=constants["field_grid"],
+            basis=self._basis,
+            params=field_params,
+            chunk_size=self._bs_chunk_size,
+        )
+
+        # Add plasma contribution
+        if constants["B_plasma"] is not None:
+            # Equilibrium fixed: use precomputed field
+            B_total = B_total + constants["B_plasma"]
+        elif self._eq is not None and not self._eq_fixed:
+            # Equilibrium optimizing: compute on the fly
+            B_total = B_total + self._eq.compute_magnetic_field(
+                coords=points,
+                chunk_size=self._bs_chunk_size,
+                source_grid=constants["eq_grid"],
+                params=eq_params,
+                basis=self._basis,
+                transforms=constants["eq_transforms"],
+                **self._eq_kwargs,
+            )
+
+        return jnp.sum(B_total * normals, axis=-1)
 
 
 class ToroidalFlux(_Objective):

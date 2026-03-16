@@ -2,6 +2,7 @@
 
 from ._bootstrap import BootstrapRedlConsistency
 from ._coils import (
+    Bxdl,
     CoilArclengthVariance,
     CoilCurrentLength,
     CoilCurvature,
@@ -17,6 +18,7 @@ from ._coils import (
     SurfaceCurrentRegularization,
     SurfaceQuadraticFlux,
     ToroidalFlux,
+    FieldNormalError
 )
 from ._equilibrium import (
     CurrentDensity,
