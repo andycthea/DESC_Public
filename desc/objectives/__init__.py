@@ -29,7 +29,7 @@ from ._equilibrium import (
     RadialForceBalance,
 )
 from ._fast_ion import GammaC
-from ._free_boundary import BoundaryError, VacuumBoundaryError
+from ._free_boundary import BoundaryError, VacuumBoundaryError, SurfaceBNError
 from ._generic import (
     ExternalObjective,
     GenericObjective,

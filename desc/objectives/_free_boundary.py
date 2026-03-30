@@ -7,6 +7,7 @@ from desc.backend import jnp
 from desc.compute import get_profiles, get_transforms
 from desc.compute.utils import _compute as compute_fun
 from desc.grid import LinearGrid
+from desc.geometry import Surface
 from desc.integrals import DFTInterpolator, FFTInterpolator, virtual_casing_biot_savart
 from desc.nestor import Nestor
 from desc.objectives.objective_funs import _Objective, collect_docs
@@ -21,6 +22,321 @@ from desc.utils import (
 
 from ..integrals.singularities import best_params, best_ratio
 from .normalization import compute_scaling_factors
+
+
+class SurfaceBNError(_Objective):
+    """Target for free boundary conditions on fourier surface.
+
+    Computes the residuals of the following:
+
+    𝐁ₒᵤₜ ⋅ 𝐧 = 0
+
+    Where 𝐁ₒᵤₜ is the total field, and 𝐧 is the outward surface
+    normal. All residuals are weighted by the local area element ||𝐞_θ × 𝐞_ζ|| Δθ Δζ
+
+    Parameters
+    ----------
+    surface : Surface
+        Surface that will be optimized to satisfy the Objective.
+    field : MagneticField
+        External field produced by coils or other sources outside the plasma.
+    eval_grid : Grid, optional
+        Collocation grid containing the nodes to evaluate error at. Should be at rho=1.
+        Defaults to ``LinearGrid(M=surface.M*2, N=surface.N*2)``
+    field_grid : Grid, optional
+        Grid used to discretize field. Defaults to the default grid for given field.
+    bs_chunk_size : int or None
+        Size to split Biot-Savart computation into chunks of evaluation points.
+        If no chunking should be done or the chunk size is the full input
+        then supply ``None``.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.", bounds_default="``target=0``."
+    )
+
+    _static_attrs = _Objective._static_attrs + [
+        "_bs_chunk_size",
+        "_surface_data_keys",
+        "_method",
+    ]
+
+    _scalar = False
+    _linear = False
+    _print_value_fmt = "Boundary Error: "
+    _units = "(T*m^2)"
+    _coordinates = "rtz"
+
+    def __init__(
+        self,
+        surface,
+        field,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        eval_grid=None,
+        field_grid=None,
+        name="Surface boundary error",
+        jac_chunk_size=None,
+        method=None,
+        *,
+        bs_chunk_size=None,
+        **kwargs,
+    ):
+        eval_grid = parse_argname_change(eval_grid, kwargs, "grid", "eval_grid")
+        if target is None and bounds is None:
+            target = 0
+        self._eval_grid = eval_grid
+        self._surface = surface
+        self._field = [field] if not isinstance(field, list) else field
+        self._field_grid = field_grid
+        self._bs_chunk_size = bs_chunk_size
+        self._method = method
+        things = [surface]
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        from desc.magnetic_fields import SumMagneticField
+
+        surface = self.things[0]
+        if self._eval_grid is None:
+            grid = LinearGrid(
+                rho=np.array([1.0]), M=surface.M*2, N=surface.N*2, NFP=surface.NFP, sym=False
+            )
+        else:
+            grid = self._eval_grid
+
+        # data = eq.compute(["p", "current"])
+        # pres = np.max(np.abs(data["p"]))
+        # curr = np.max(np.abs(data["current"]))
+        errorif(
+            not np.all(grid.nodes[:, 0] == 1.0),
+            ValueError,
+            "grid contains nodes not on rho=1",
+        )
+
+        self._surface_data_keys = [
+            "R",
+            "phi",
+            "Z",
+            "n_rho",
+            "|e_theta x e_zeta|",
+        ]
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+
+        transforms = get_transforms(self._surface_data_keys, obj=surface, grid=grid)
+
+        eq_field_transforms = get_transforms(
+            ["J", "phi", "sqrt(g)", "x"],
+            obj=self._field[1],
+            grid=self._field_grid[1],
+            method='biot-savart',
+            # **kwargs,
+        )
+
+        self._constants = {
+            "transforms": transforms,
+            "field": SumMagneticField(self._field),
+            "quad_weights": np.sqrt(transforms["grid"].weights),
+            "field_transforms": [None, eq_field_transforms]
+        }
+
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        self._dim_f = grid.num_nodes
+
+        if self._normalize:
+            scales = compute_scaling_factors(surface)
+            print(scales.keys())
+            Bn_norm = np.ones(grid.num_nodes) * scales["R0"] * scales["a"]
+            self._normalization = Bn_norm
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, surface_params, *field_params, constants=None):
+        """Compute boundary force error.
+
+        Parameters
+        ----------
+        surface_params : dict
+            Dictionary of surface degrees of freedom, eg Surface.params_dict
+        field_params : dict
+            Dictionary of field parameters, if field is not fixed.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants
+
+        Returns
+        -------
+        f : ndarray
+            Boundary error.  √g𝐁⋅𝐧 in T*m^2
+
+        """
+        if field_params == ():  # common case for field_fixed=True
+            field_params = None
+        if constants is None:
+            constants = self.constants
+        data = compute_fun(
+            "desc.geometry.surface.FourierRZToroidalSurface",
+            self._surface_data_keys,
+            params=surface_params,
+            transforms=constants["transforms"],
+            profiles={},
+        )
+        x = jnp.array([data["R"], data["phi"], data["Z"]]).T
+        # can always pass in field params. If they're None, it just uses the
+        # defaults for the given field.
+        print(self._method)
+        Bext = constants["field"].compute_magnetic_field(
+            x,
+            source_grid=self._field_grid,
+            basis="rpz",
+            params=field_params,
+            chunk_size=self._bs_chunk_size,
+            method=self._method,
+            transforms=constants["field_transforms"],
+        )
+        Bex_total = Bext
+        Bn = jnp.sum(Bex_total * data["n_rho"], axis=-1)
+
+        g = data["|e_theta x e_zeta|"]
+        Bn_err = Bn * g
+        return Bn_err
+
+    def print_value(self, args, args0=None, **kwargs):
+        """Print the value of the objective and return a dict of values."""
+        out = {}
+        # this objective is really 2 residuals concatenated so its helpful to print
+        # them individually
+        f = self.compute_unscaled(*args, **kwargs)
+        f0 = self.compute_unscaled(*args0, **kwargs) if args0 is not None else f
+        # try to do weighted mean if possible
+        constants = kwargs.get("constants", self.constants)
+        if constants is None:
+            w = jnp.ones_like(f)
+        else:
+            w = constants["quad_weights"]
+
+        abserr = jnp.all(self.target == 0)
+        pre_width = len("Maximum absolute ") if abserr else len("Maximum ")
+
+        def _print(fmt, fmax, fmin, fmean, f0max, f0min, f0mean, norm, units):
+
+            print(
+                "Maximum "
+                + ("absolute " if abserr else "")
+                + fmt.format(f0max, fmax)
+                + units
+            )
+            print(
+                "Minimum "
+                + ("absolute " if abserr else "")
+                + fmt.format(f0min, fmin)
+                + units
+            )
+            print(
+                "Average "
+                + ("absolute " if abserr else "")
+                + fmt.format(f0mean, fmean)
+                + units
+            )
+
+            if self._normalize and units != "(dimensionless)":
+                print(
+                    "Maximum "
+                    + ("absolute " if abserr else "")
+                    + fmt.format(f0max / norm, fmax / norm)
+                    + "(normalized)"
+                )
+                print(
+                    "Minimum "
+                    + ("absolute " if abserr else "")
+                    + fmt.format(f0min / norm, fmin / norm)
+                    + "(normalized)"
+                )
+                print(
+                    "Average "
+                    + ("absolute " if abserr else "")
+                    + fmt.format(f0mean / norm, fmean / norm)
+                    + "(normalized)"
+                )
+
+        formats = [
+            "Boundary normal field error: ",
+            "Boundary magnetic pressure error: ",
+        ]
+        units = ["(T*m^2)"]
+        nn = f.size
+        norms = [self.normalization[0]]
+        for i, (fmti, norm, units) in enumerate(zip(formats, norms, units)):
+            fi = f[i * nn : (i + 1) * nn]
+            f0i = f0[i * nn : (i + 1) * nn]
+            # target == 0 probably indicates f is some sort of error metric,
+            # mean abs makes more sense than mean
+            fi = jnp.abs(fi) if abserr else fi
+            f0i = jnp.abs(f0i) if abserr else f0i
+            wi = w[i * nn : (i + 1) * nn]
+            fmax = jnp.max(fi)
+            fmin = jnp.min(fi)
+            fmean = jnp.mean(fi * wi) / jnp.mean(wi)
+
+            f0max = jnp.max(f0i)
+            f0min = jnp.min(f0i)
+            f0mean = jnp.mean(f0i * wi) / jnp.mean(wi)
+            out[fmti] = {
+                "f_max": fmax,
+                "f_min": fmin,
+                "f_mean": fmean,
+                "f_max_norm": fmax / norm,
+                "f_min_norm": fmin / norm,
+                "f_mean_norm": fmean / norm,
+            }
+            if args0 is not None:
+                out[fmti]["f0_max"] = f0max
+                out[fmti]["f0_min"] = f0min
+                out[fmti]["f0_mean"] = f0mean
+                out[fmti]["f0_max_norm"] = f0max / norm
+                out[fmti]["f0_min_norm"] = f0min / norm
+                out[fmti]["f0_mean_norm"] = f0mean / norm
+            fmt = (
+                f"{fmti:<{PRINT_WIDTH-pre_width}}" + "{:10.3e}  -->  {:10.3e} "
+                if args0 is not None
+                else f"{fmti:<{PRINT_WIDTH-pre_width}}" + "{:10.3e} "
+            )
+            _print(fmt, fmax, fmin, fmean, f0max, f0min, f0mean, norm, units)
+        return out
 
 
 class VacuumBoundaryError(_Objective):
