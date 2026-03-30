@@ -1330,6 +1330,7 @@ class Equilibrium(Optimizable, _MagneticField):
                 grid=source_grid,
                 params=params,
                 transforms=transforms,
+                override_grid=False,
             )
 
             # Surface element, must divide by NFP to remove the NFP multiple on the
@@ -1353,7 +1354,7 @@ class Equilibrium(Optimizable, _MagneticField):
                     source_xyz,
                     J=J,
                     dV=dV,
-                    chunk_size=50,
+                    chunk_size=chunk_size,
                     return_rtz=return_rtz,
                 )
                 if return_rtz:
