@@ -2639,6 +2639,7 @@ def field_line_integrate(
     bs_chunk_size=None,
     options=None,
     return_aux=False,
+    transforms=None,
     method="virtual casing",
 ):
     """Trace field lines by integration, using diffrax package.
@@ -2736,6 +2737,7 @@ def field_line_integrate(
         method=method,
         options=options,
         return_aux=return_aux,
+        transforms=transforms,
     )
 
 
@@ -2758,6 +2760,7 @@ def _field_line_integrate(
     bs_chunk_size=None,
     method="virtual casing",
     return_aux=False,
+    transforms=None,
 ):
     """JIT/AD friendly field line integrator.
 
@@ -2792,7 +2795,7 @@ def _field_line_integrate(
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="unhashable type")
         out = vmap_chunked(
-            _intfun_wrapper, in_axes=(0,) + 15 * (None,), chunk_size=chunk_size
+            _intfun_wrapper, in_axes=(0,) + 16 * (None,), chunk_size=chunk_size
         )(
             x0,
             field,
@@ -2810,6 +2813,7 @@ def _field_line_integrate(
             bs_chunk_size,
             method,
             options,
+            transforms
         )
 
     x = out.ys
