@@ -2637,6 +2637,7 @@ def field_line_integrate(
     bounds_Z=(-np.inf, np.inf),
     chunk_size=None,
     bs_chunk_size=None,
+    phi0=None,
     options=None,
     return_aux=False,
     transforms=None,
@@ -2734,6 +2735,7 @@ def field_line_integrate(
         adjoint=adjoint,
         chunk_size=chunk_size,
         bs_chunk_size=bs_chunk_size,
+        phi0=phi0,
         method=method,
         options=options,
         return_aux=return_aux,
@@ -2758,6 +2760,7 @@ def _field_line_integrate(
     options,
     chunk_size=None,
     bs_chunk_size=None,
+    phi0=None,
     method="virtual casing",
     return_aux=False,
     transforms=None,
@@ -2786,7 +2789,9 @@ def _field_line_integrate(
     rshape = r0.shape
     r0 = r0.flatten()
     z0 = z0.flatten()
-    x0 = jnp.array([r0, phis[0] * jnp.ones_like(r0), z0]).T
+    if phi0 is None:
+        phi0 = phis[0]
+    x0 = jnp.array([r0, phi0 * jnp.ones_like(r0), z0]).T
     # scale to make toroidal field (bp) positive
     scale = jnp.sign(field.compute_magnetic_field(x0)[0, 1])
 
