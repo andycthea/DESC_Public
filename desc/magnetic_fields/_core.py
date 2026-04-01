@@ -52,7 +52,7 @@ from desc.vmec_utils import ptolemy_identity_fwd, ptolemy_identity_rev
 
 
 def biot_savart_general(
-    re, rs, J, dV=jnp.array([1.0]), chunk_size=None, return_rtz=False
+    re, rs, J, dV=jnp.array([1.0]), chunk_size=None, return_rtz=False, cutoff_dist=None
 ):
     """Biot-Savart law for arbitrary sources.
 
@@ -74,6 +74,9 @@ def biot_savart_general(
         Size to split computation into chunks of evaluation points.
         If no chunking should be done or the chunk size is the full input
         then supply ``None``. Default is ``None``.
+    cutoff_dist : float or None
+        The minimum distance for eval point to be from source point. If a source
+        point is closer than cutoff_dist, it is zeroed out.
 
     Returns
     -------
@@ -91,9 +94,11 @@ def biot_savart_general(
     def biot(re):
         dr = rs - re
         dr_norm = jnp.linalg.norm(dr, axis=-1, keepdims=True)
+        if cutoff_dist is not None: dr_norm = jnp.where(dr_norm < cutoff_dist, jnp.inf, dr_norm)
         num = jnp.cross(dr, JdV, axis=-1)
         den = dr_norm**3
-        B = safediv(num, den).sum(axis=-2) * mu_0 / (4 * jnp.pi)
+        if cutoff_dist is None: B = safediv(num, den).sum(axis=-2) * mu_0 / (4 * jnp.pi)
+        else: B = (num / den).sum(axis=-2) * mu_0 / (4 * jnp.pi)
         if return_rtz:
             idx = jnp.argmin(dr_norm, axis=-2)
             min_dist = jnp.take_along_axis(dr_norm, idx[..., None, :], axis=-2)[
