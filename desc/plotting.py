@@ -1174,13 +1174,28 @@ def plot_3d(  # noqa : C901
     showaxislabels = kwargs.pop("showaxislabels", True)
 
     if name != "B*n":
-        data, label = _compute(
-            eq,
-            name,
-            grid,
-            component=component,
-            compute_kwargs=compute_kwargs,
-        )
+        if isinstance(name, list):
+            data = None
+            label = ""
+            for v in name:
+                _data, _label = _compute(
+                    eq,
+                    v,
+                    grid,
+                    component=component,
+                    compute_kwargs=compute_kwargs,
+                )
+                if data is None: data = _data
+                else: data = data * _data
+                label = label + f" x {_label}"
+        else:
+            data, label = _compute(
+                eq,
+                name,
+                grid,
+                component=component,
+                compute_kwargs=compute_kwargs,
+            )
     else:
         data, label = _compute_Bn(
             eq=eq,
@@ -1279,7 +1294,7 @@ def plot_3d(  # noqa : C901
         dpi=dpi,
         title=title,
     )
-    plot_data = {"X": X, "Y": Y, "Z": Z, name: data}
+    plot_data = {"X": X, "Y": Y, "Z": Z, (name if not isinstance(name, list) else label): data}
 
     if normalize:
         plot_data["normalization"] = np.nanmean(np.abs(norm_data))
