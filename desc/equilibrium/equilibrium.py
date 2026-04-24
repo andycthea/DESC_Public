@@ -1260,6 +1260,7 @@ class Equilibrium(Optimizable, _MagneticField):
         method="biot-savart",
         return_data=False,
         return_rtz=False,
+        cutoff_dist=None,
     ):
         """Compute magnetic field at a set of points.
 
@@ -1332,6 +1333,8 @@ class Equilibrium(Optimizable, _MagneticField):
                 transforms=transforms,
                 override_grid=False,
             )
+            # FIX NAN VALUES AT AXIS
+            data["J"] = jnp.where(jnp.isnan(data["J"]), 0.0, data["J"])
 
             # Surface element, must divide by NFP to remove the NFP multiple on the
             # Surface grid weights, as we account for it during the for loop over NFP
@@ -1356,6 +1359,7 @@ class Equilibrium(Optimizable, _MagneticField):
                     dV=dV,
                     chunk_size=chunk_size,
                     return_rtz=return_rtz,
+                    cutoff_dist=cutoff_dist,
                 )
                 if return_rtz:
                     B, idx, dist = f
