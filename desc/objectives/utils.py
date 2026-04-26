@@ -89,6 +89,9 @@ def factorize_linear_constraints(objective, constraint, x_scale="auto"):  # noqa
                     if arg in objective._args:  # these Equilibrium args are kept
                         cols = np.append(cols, np.arange(c, c + dim))
                     c += dim  # other Equilibrium args are removed
+            elif objective._has_vacuum_eq and t is objective._eq_vac:
+                # vacuum eq contributes 0 DOFs, skip all its columns
+                c += t.dim_x
             else:  # non-Equilibrium args are always included
                 cols = np.append(cols, np.arange(c, c + t.dim_x))
                 c += t.dim_x
