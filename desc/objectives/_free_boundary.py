@@ -764,10 +764,12 @@ class BoundaryError(_Objective):
         "_bs_chunk_size",
         "_eq_data_keys",
         "_field_fixed",
+        "_has_vacuum_eq",
         "_q",
         "_sheet_current",
         "_sheet_data_keys",
         "_use_same_grid",
+        "_vac_eq_data_keys",
     ]
 
     _scalar = False
@@ -794,6 +796,7 @@ class BoundaryError(_Objective):
         eval_grid=None,
         field_grid=None,
         field_fixed=False,
+        vacuum_eq=None,
         name="Boundary error",
         jac_chunk_size=None,
         *,
@@ -817,7 +820,10 @@ class BoundaryError(_Objective):
             B_plasma_chunk_size = None
         self._B_plasma_chunk_size = B_plasma_chunk_size
         self._sheet_current = hasattr(eq.surface, "Phi_mn")
+        self._has_vacuum_eq = vacuum_eq is not None
         things = [eq]
+        if self._has_vacuum_eq:
+            things.append(vacuum_eq)
         if not field_fixed:
             things.append(self._field)
         super().__init__(
@@ -967,6 +973,38 @@ class BoundaryError(_Objective):
                 )
             )
 
+        if self._has_vacuum_eq:
+            vac_eq = self.things[1]
+            self._vac_eq_data_keys = [
+                "K_vc",
+                "B",
+                "R",
+                "phi",
+                "Z",
+                "n_rho",
+                "|e_theta x e_zeta|",
+            ]
+            vac_source_profiles = get_profiles(
+                self._vac_eq_data_keys, obj=vac_eq, grid=source_grid
+            )
+            vac_source_transforms = get_transforms(
+                self._vac_eq_data_keys, obj=vac_eq, grid=source_grid
+            )
+            if self._use_same_grid:
+                vac_eval_profiles = vac_source_profiles
+                vac_eval_transforms = vac_source_transforms
+            else:
+                vac_eval_profiles = get_profiles(
+                    self._vac_eq_data_keys, obj=vac_eq, grid=eval_grid
+                )
+                vac_eval_transforms = get_transforms(
+                    self._vac_eq_data_keys, obj=vac_eq, grid=eval_grid
+                )
+            self._constants["vac_source_transforms"] = vac_source_transforms
+            self._constants["vac_source_profiles"] = vac_source_profiles
+            self._constants["vac_eval_transforms"] = vac_eval_transforms
+            self._constants["vac_eval_profiles"] = vac_eval_profiles
+
         timer.stop("Precomputing transforms")
         if verbose > 1:
             timer.disp("Precomputing transforms")
@@ -990,15 +1028,16 @@ class BoundaryError(_Objective):
 
         super().build(use_jit=use_jit, verbose=verbose)
 
-    def compute(self, eq_params, *field_params, constants=None):
+    def compute(self, eq_params, *other_params, constants=None):
         """Compute boundary force error.
 
         Parameters
         ----------
         eq_params : dict
             Dictionary of equilibrium degrees of freedom, eg Equilibrium.params_dict
-        field_params : dict
-            Dictionary of field parameters, if field is not fixed.
+        other_params : dict
+            Dictionary of vacuum eq params (if vacuum_eq is set) and/or field
+            parameters (if field is not fixed).
         constants : dict
             Dictionary of constant data, eg transforms, profiles etc. Defaults to
             self.constants
@@ -1011,6 +1050,14 @@ class BoundaryError(_Objective):
             √g||μ₀𝐊 − 𝐧 × [𝐁]|| in T*m^2
 
         """
+        # Parse variadic params based on which things are present
+        idx = 0
+        if self._has_vacuum_eq and idx < len(other_params):
+            vac_eq_params = other_params[idx]
+            idx += 1
+        else:
+            vac_eq_params = None
+        field_params = other_params[idx:] if idx < len(other_params) else ()
         if field_params == ():  # common case for field_fixed=True
             field_params = None
         if constants is None:
@@ -1070,6 +1117,36 @@ class BoundaryError(_Objective):
         )
         # need extra factor of B/2 bc we're evaluating on plasma surface
         Bplasma = Bplasma + eval_data["B"] / 2
+
+        # Subtract vacuum virtual casing to remove numerical error
+        if self._has_vacuum_eq and vac_eq_params is not None:
+            vac_source_data = compute_fun(
+                "desc.equilibrium.equilibrium.Equilibrium",
+                self._vac_eq_data_keys,
+                params=vac_eq_params,
+                transforms=constants["vac_source_transforms"],
+                profiles=constants["vac_source_profiles"],
+            )
+            vac_eval_data = (
+                vac_source_data
+                if self._use_same_grid
+                else compute_fun(
+                    "desc.equilibrium.equilibrium.Equilibrium",
+                    self._vac_eq_data_keys,
+                    params=vac_eq_params,
+                    transforms=constants["vac_eval_transforms"],
+                    profiles=constants["vac_eval_profiles"],
+                )
+            )
+            Bplasma_vac = virtual_casing_biot_savart(
+                vac_eval_data,
+                vac_source_data,
+                constants["interpolator"],
+                chunk_size=self._B_plasma_chunk_size,
+            )
+            Bplasma_vac = Bplasma_vac + vac_eval_data["B"] / 2
+            Bplasma = Bplasma - Bplasma_vac
+
         x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
         # can always pass in field params. If they're None, it just uses the
         # defaults for the given field.

@@ -601,12 +601,14 @@ def _maybe_wrap_nonlinear_constraints(
     if wrapper is not None and wrapper.lower() in ["prox", "proximal"]:
         perturb_options = options.pop("perturb_options", {})
         solve_options = options.pop("solve_options", {})
+        vacuum_eq = options.pop("vacuum_eq", None)
         objective = ProximalProjection(
             objective,
             constraint=_combine_constraints(nonlinear_constraints),
             perturb_options=perturb_options,
             solve_options=solve_options,
             eq=eq,
+            vacuum_eq=vacuum_eq,
         )
         nonlinear_constraints = ()
     return objective, nonlinear_constraints
@@ -635,6 +637,10 @@ def get_combined_constraint_objectives(  # noqa: C901
         eq, objective, nonlinear_constraints, opt_method, options
     )
     is_prox = isinstance(objective, ProximalProjection)
+    # If proximal projection has a vacuum eq, add it to things list
+    if is_prox and objective._has_vacuum_eq:
+        if objective._eq_vac not in things:
+            things.append(objective._eq_vac)
     for t in things:
         if isinstance(t, Equilibrium) and is_prox:
             # don't add Equilibrium self-consistency if proximal is used

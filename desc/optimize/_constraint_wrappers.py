@@ -9,6 +9,7 @@ from desc.batching import batched_vectorize
 from desc.objectives import (
     BoundaryRSelfConsistency,
     BoundaryZSelfConsistency,
+    ForceBalance,
     ObjectiveFunction,
     get_fixed_boundary_constraints,
     maybe_add_self_consistency,
@@ -583,6 +584,7 @@ class ProximalProjection(ObjectiveFunction):
         eq,
         perturb_options=None,
         solve_options=None,
+        vacuum_eq=None,
         name="ProximalProjection",
     ):
         assert isinstance(objective, ObjectiveFunction), (
@@ -623,6 +625,8 @@ class ProximalProjection(ObjectiveFunction):
         self._use_jit = False
         self._compiled = False
         self._eq = eq
+        self._eq_vac = vacuum_eq
+        self._has_vacuum_eq = vacuum_eq is not None
         self._name = name
 
     def _set_eq_state_vector(self):
@@ -682,6 +686,56 @@ class ProximalProjection(ObjectiveFunction):
         # ]                                                       # noqa : E800
         self._dxdc = jnp.hstack(dxdc)
 
+        # Build vacuum eq state vector mapping if vacuum eq is provided
+        if self._has_vacuum_eq:
+            (self._eq_vac_Z, self._eq_vac_D, self._eq_vac_unfixed_idx) = (
+                self._eq_vac_solve_objective._Z,
+                self._eq_vac_solve_objective._D,
+                self._eq_vac_solve_objective._unfixed_idx,
+            )
+            # Build dxdc_vac: maps main eq's Rb_lmn/Zb_lmn to vacuum eq full state
+            xz_vac = {
+                arg: np.zeros(self._eq_vac.dimensions[arg])
+                for arg in self._eq_vac.optimizable_params
+            }
+            dxdc_vac_parts = []
+            for arg in self._args:
+                if arg == "Rb_lmn":
+                    c = get_instance(
+                        self._eq_vac_linear_constraints, BoundaryRSelfConsistency
+                    )
+                    A = c.jac_unscaled(xz_vac)[0]["R_lmn"]
+                    Ainv = np.linalg.pinv(A)
+                    dxdRb_vac = (
+                        np.eye(self._eq_vac.dim_x)[
+                            :, self._eq_vac.x_idx["R_lmn"]
+                        ]
+                        @ Ainv
+                    )
+                    dxdc_vac_parts.append(dxdRb_vac)
+                elif arg == "Zb_lmn":
+                    c = get_instance(
+                        self._eq_vac_linear_constraints, BoundaryZSelfConsistency
+                    )
+                    A = c.jac_unscaled(xz_vac)[0]["Z_lmn"]
+                    Ainv = np.linalg.pinv(A)
+                    dxdZb_vac = (
+                        np.eye(self._eq_vac.dim_x)[
+                            :, self._eq_vac.x_idx["Z_lmn"]
+                        ]
+                        @ Ainv
+                    )
+                    dxdc_vac_parts.append(dxdZb_vac)
+                else:
+                    # Non-boundary params (profiles) don't affect the vacuum eq,
+                    # so their columns are zero
+                    dxdc_vac_parts.append(
+                        np.zeros(
+                            (self._eq_vac.dim_x, self._eq.dimensions[arg])
+                        )
+                    )
+            self._dxdc_vac = jnp.hstack(dxdc_vac_parts)
+
     def build(self, use_jit=None, verbose=1):  # noqa: C901
         """Build the objective.
 
@@ -726,6 +780,27 @@ class ProximalProjection(ObjectiveFunction):
         )
         self._eq_solve_objective.build(use_jit=use_jit, verbose=verbose)
 
+        # Build vacuum eq solve infrastructure if vacuum eq is provided
+        if self._has_vacuum_eq:
+            self._eq_vac_linear_constraints = get_fixed_boundary_constraints(
+                eq=self._eq_vac
+            )
+            self._eq_vac_linear_constraints = maybe_add_self_consistency(
+                self._eq_vac, self._eq_vac_linear_constraints
+            )
+            self._eq_vac_constraint = ObjectiveFunction(
+                [ForceBalance(eq=self._eq_vac)]
+            )
+            self._eq_vac_constraint.build(use_jit=use_jit, verbose=verbose)
+            for con in self._eq_vac_linear_constraints:
+                con.build(use_jit=use_jit, verbose=verbose)
+            self._eq_vac_solve_objective = LinearConstraintProjection(
+                self._eq_vac_constraint,
+                ObjectiveFunction(self._eq_vac_linear_constraints),
+                name="Vac Eq Update LinearConstraintProjection",
+            )
+            self._eq_vac_solve_objective.build(use_jit=use_jit, verbose=verbose)
+
         errorif(
             self._constraint.things != [self._eq],
             ValueError,
@@ -756,6 +831,12 @@ class ProximalProjection(ObjectiveFunction):
             [self._eq.dimensions[arg] for arg in self._args]
         )
 
+        if self._has_vacuum_eq:
+            self._eq_vac_idx = self.things.index(self._eq_vac)
+            # vacuum eq has 0 independent optimization variables;
+            # its state is fully determined by the main eq's boundary
+            self._dimc_per_thing[self._eq_vac_idx] = 0
+
         # equivalent matrix for A[unfixed_idx] @ D @ Z == A @ feasible_tangents
         self._feasible_tangents = jnp.eye(self._objective.dim_x)
         self._feasible_tangents = jnp.split(
@@ -770,9 +851,27 @@ class ProximalProjection(ObjectiveFunction):
         self._feasible_tangents[self._eq_idx] = self._feasible_tangents[self._eq_idx][
             :, self._eq_unfixed_idx
         ] @ (self._eq_Z * self._eq_D[self._eq_unfixed_idx, None])
+        if self._has_vacuum_eq:
+            # Vacuum eq feasible tangents: maps from vacuum eq's reduced state
+            # to its full state vector
+            self._feasible_tangents[self._eq_vac_idx] = self._feasible_tangents[
+                self._eq_vac_idx
+            ][:, self._eq_vac_unfixed_idx] @ (
+                self._eq_vac_Z * self._eq_vac_D[self._eq_vac_unfixed_idx, None]
+            )
         self._feasible_tangents = jnp.concatenate(
             [np.atleast_2d(foo) for foo in self._feasible_tangents], axis=-1
         )
+
+        # Store the column dimensions per thing for the feasible tangents matrix.
+        # These are the sizes of the "response vectors" dfdc for each thing.
+        # For the main eq: dim_x_reduced_eq (from the solve objective's Z)
+        # For the vacuum eq: dim_x_reduced_vac
+        # For other things: dimx_per_thing (identity block, unchanged)
+        self._dfdc_dims = list(self._dimx_per_thing)
+        self._dfdc_dims[self._eq_idx] = self._eq_Z.shape[1]
+        if self._has_vacuum_eq:
+            self._dfdc_dims[self._eq_vac_idx] = self._eq_vac_Z.shape[1]
 
         ## history and caching
         # first, ensure equilibrium is solved to the
@@ -784,11 +883,21 @@ class ProximalProjection(ObjectiveFunction):
                 constraints=None,
                 **self._solve_options,
             )
+            if self._has_vacuum_eq:
+                self._eq_vac.solve(
+                    objective=self._eq_vac_solve_objective,
+                    constraints=None,
+                    **self._solve_options,
+                )
         # then store the now-solved eq state as the initial state
         self._x_old = self.x(self.things)
         self._allx = [self._x_old]
         self._allxopt = [self._objective.x(*self.things)]
         self._allxeq = [self._eq.pack_params(self._eq.params_dict)]
+        if self._has_vacuum_eq:
+            self._allxeq_vac = [
+                self._eq_vac.pack_params(self._eq_vac.params_dict)
+            ]
         self.history = [[t.params_dict.copy() for t in self.things]]
 
         self._built = True
@@ -838,6 +947,13 @@ class ProximalProjection(ObjectiveFunction):
                     }
                 )
                 params += [p]
+            elif self._has_vacuum_eq and t is self._eq_vac:
+                # vacuum eq has 0 optimization variables; return zero-filled params
+                p = {
+                    arg: jnp.zeros_like(xis)
+                    for arg, xis in t.params_dict.items()
+                }
+                params += [p]
             else:
                 params += [t.unpack_params(xi)]
 
@@ -868,6 +984,9 @@ class ProximalProjection(ObjectiveFunction):
                         [jnp.atleast_1d(t.params_dict[arg]) for arg in self._args]
                     )
                 ]
+            elif self._has_vacuum_eq and t is self._eq_vac:
+                # vacuum eq has 0 optimization variables, skip
+                continue
             else:
                 xs += [t.pack_params(t.params_dict)]
 
@@ -884,6 +1003,9 @@ class ProximalProjection(ObjectiveFunction):
         for t in self.things:
             if t is self._eq:
                 s += sum(self._eq.dimensions[arg] for arg in self._args)
+            elif self._has_vacuum_eq and t is self._eq_vac:
+                # vacuum eq has 0 optimization variables
+                continue
             else:
                 s += t.dim_x
         return s
@@ -915,6 +1037,8 @@ class ProximalProjection(ObjectiveFunction):
         xopt = f_where_x(x, self._allx, self._allxopt)
         xeq = f_where_x(x, self._allx, self._allxeq)
         if xopt.size > 0 and xeq.size > 0:
+            if self._has_vacuum_eq:
+                xeq_vac = f_where_x(x, self._allx, self._allxeq_vac)
             pass
         else:
             # After unpack_state, R_lmn, Z_lmn, L_lmn, Ra_n and Za_n in below lists
@@ -939,6 +1063,35 @@ class ProximalProjection(ObjectiveFunction):
             )
             xeq = self._eq.pack_params(self._eq.params_dict)
             x_list[self._eq_idx] = self._eq.params_dict.copy()
+
+            # Also update the vacuum equilibrium with the same boundary deltas
+            if self._has_vacuum_eq:
+                # Only boundary deltas affect the vacuum eq
+                vac_deltas = {}
+                for key in self._eq_vac.params_dict:
+                    if key in ["Rb_lmn", "Zb_lmn"]:
+                        vac_deltas[key] = deltas.get(key, jnp.zeros_like(
+                            self._eq_vac.params_dict[key]
+                        ))
+                    else:
+                        vac_deltas[key] = jnp.zeros_like(
+                            self._eq_vac.params_dict[key]
+                        )
+                self._eq_vac = self._eq_vac.perturb(
+                    objective=self._eq_vac_solve_objective,
+                    constraints=None,
+                    deltas=vac_deltas,
+                    **self._perturb_options,
+                )
+                self._eq_vac.solve(
+                    objective=self._eq_vac_solve_objective,
+                    constraints=None,
+                    **self._solve_options,
+                )
+                xeq_vac = self._eq_vac.pack_params(self._eq_vac.params_dict)
+                x_list[self._eq_vac_idx] = self._eq_vac.params_dict.copy()
+                self._allxeq_vac.append(xeq_vac)
+
             xopt = jnp.concatenate(
                 [t.pack_params(xi) for t, xi in zip(self.things, x_list)]
             )
@@ -952,11 +1105,18 @@ class ProximalProjection(ObjectiveFunction):
             xeq_dict = self._eq.unpack_params(xeq)
             self._eq.params_dict = xeq_dict
             x_list[self._eq_idx] = xeq_dict
+            if self._has_vacuum_eq:
+                xeq_vac_dict = self._eq_vac.unpack_params(xeq_vac)
+                self._eq_vac.params_dict = xeq_vac_dict
+                x_list[self._eq_vac_idx] = xeq_vac_dict
             self.history.append(x_list)
         else:
             # reset to last good params
             self._eq.params_dict = self.history[-1][self._eq_idx]
             self._eq_solve_objective.update_constraint_target(self._eq)
+            if self._has_vacuum_eq:
+                self._eq_vac.params_dict = self.history[-1][self._eq_vac_idx]
+                self._eq_vac_solve_objective.update_constraint_target(self._eq_vac)
 
         return xopt, xeq
 
@@ -1264,8 +1424,24 @@ class ProximalProjection(ObjectiveFunction):
             op,
         )
         # broadcasting against multiple things
-        dfdcs = [jnp.zeros(dim) for dim in self._dimc_per_thing]
+        dfdcs = [jnp.zeros(dim) for dim in self._dfdc_dims]
         dfdcs[self._eq_idx] = dfdc
+
+        # Also compute vacuum eq's response to boundary changes
+        if self._has_vacuum_eq:
+            xf_vac = self._eq_vac.pack_params(self._eq_vac.params_dict)
+            # The vacuum eq constraint is just ForceBalance on the vacuum eq
+            dfdc_vac = _proximal_jvp_f_pure(
+                self._eq_vac_constraint,
+                xf_vac,
+                self._eq_vac_constraint.constants,
+                vs[self._eq_idx],
+                self._eq_vac_solve_objective._feasible_tangents,
+                self._dxdc_vac,
+                op,
+            )
+            dfdcs[self._eq_vac_idx] = dfdc_vac
+
         # note that dfdc.size != vs[self._eq_idx].size
         # dfdc has the size of reduced state vector of the equilibrium
         # but vs[self._eq_idx] has the size of self._args DoFs
@@ -1283,13 +1459,20 @@ class ProximalProjection(ObjectiveFunction):
         # J @ [(tangent vectors in c direction) - (tangent vectors in x direction)@dfdc]
         # Note: We will never form full Jacobian J, we will just compute the above
         # expression by JVPs.
-        dxdcv = jnp.concatenate(
-            [
-                *vs[: self._eq_idx],
-                self._dxdc @ vs[self._eq_idx],  # Rb_lmn, Zb_lmn to full eq state vector
-                *vs[self._eq_idx + 1 :],
-            ]
+        dxdcv_parts = list(vs[: self._eq_idx])
+        dxdcv_parts.append(
+            self._dxdc @ vs[self._eq_idx]  # Rb_lmn, Zb_lmn to full eq state vector
         )
+        if self._has_vacuum_eq:
+            # vacuum eq dxdc: maps main eq's opt vars to vacuum eq's full state
+            for i in range(self._eq_idx + 1, len(self.things)):
+                if i == self._eq_vac_idx:
+                    dxdcv_parts.append(self._dxdc_vac @ vs[self._eq_idx])
+                else:
+                    dxdcv_parts.append(vs[i])
+        else:
+            dxdcv_parts.extend(vs[self._eq_idx + 1 :])
+        dxdcv = jnp.concatenate(dxdcv_parts)
         tangent = dxdcv - self._feasible_tangents @ dfdc
         return tangent
 
