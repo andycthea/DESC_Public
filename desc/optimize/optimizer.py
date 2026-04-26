@@ -262,6 +262,11 @@ class Optimizer(IOAble):
                 verbose,
                 options,
             )
+            # If vacuum eq was added to things by get_combined_constraint_objectives,
+            # add a matching dummy x_scale entry (vacuum eq contributes 0 DOFs)
+            if isinstance(x_scale, (list, tuple)):
+                while len(x_scale) < len(things):
+                    x_scale.append(jnp.array([]))
         else:
             nonlinear_constraint = None
             if not objective.built:
