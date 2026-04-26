@@ -264,6 +264,9 @@ class Optimizer(IOAble):
             )
             # If vacuum eq was added to things by get_combined_constraint_objectives,
             # add a matching dummy x_scale entry (vacuum eq contributes 0 DOFs)
+            # and keep things0 in sync
+            while len(things0) < len(things):
+                things0.append(things[len(things0)].copy())
             if isinstance(x_scale, (list, tuple)):
                 while len(x_scale) < len(things):
                     x_scale.append(jnp.array([]))
