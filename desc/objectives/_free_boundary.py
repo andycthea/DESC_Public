@@ -944,9 +944,11 @@ class BoundaryError(_Objective):
         if self._use_same_grid:
             eval_profiles = source_profiles
             eval_transforms = source_transforms
+            eval_grid_g = eq.compute(["|e_theta x e_zeta|"], grid=source_grid)["|e_theta x e_zeta|"]
         else:
             eval_profiles = get_profiles(self._eq_data_keys, obj=eq, grid=eval_grid)
             eval_transforms = get_transforms(self._eq_data_keys, obj=eq, grid=eval_grid)
+            eval_grid_g = eq.compute(["|e_theta x e_zeta|"], grid=eval_grid)["|e_theta x e_zeta|"]
 
         neq = 3 if self._sheet_current else 2  # number of equations we're using
 
@@ -958,6 +960,7 @@ class BoundaryError(_Objective):
             "interpolator": interpolator,
             "field": SumMagneticField(self._field),
             "quad_weights": np.sqrt(np.tile(eval_transforms["grid"].weights, neq)),
+            "eval_g_normalization": eval_grid_g.sum(),
         }
 
         if self._sheet_current:
@@ -1165,6 +1168,7 @@ class BoundaryError(_Objective):
         bsq_in = jnp.sum(Bin_total * Bin_total, axis=-1)
 
         g = eval_data["|e_theta x e_zeta|"]
+        g = g * constants["eval_g_normalization"] / jnp.sum(g)
         Bn_err = Bn * g
         Bsq_err = jnp.where(
             eval_data["p"] == 0,
