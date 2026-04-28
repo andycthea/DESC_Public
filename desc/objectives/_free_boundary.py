@@ -770,6 +770,7 @@ class BoundaryError(_Objective):
         "_use_same_grid",
         "_has_vacuum_eq",
         "_vac_eq_data_keys",
+        "_include_Bvac_div_2",
     ]
 
     _scalar = False
@@ -784,6 +785,7 @@ class BoundaryError(_Objective):
         eq,
         field,
         eq_vac=None,
+        include_Bvac_div_2=True,
         target=None,
         bounds=None,
         weight=1,
@@ -813,6 +815,7 @@ class BoundaryError(_Objective):
         self._field = [field] if not isinstance(field, list) else field
         self._field_grid = field_grid
         self._bs_chunk_size = bs_chunk_size
+        self._include_Bvac_div_2 = include_Bvac_div_2
         B_plasma_chunk_size = parse_argname_change(
             B_plasma_chunk_size, kwargs, "loop", "B_plasma_chunk_size"
         )
@@ -1142,7 +1145,7 @@ class BoundaryError(_Objective):
                 constants["interpolator"],
                 chunk_size=self._B_plasma_chunk_size,
             )
-            Bplasma_vac = Bplasma_vac + vac_eval_data["B"] / 2
+            if self._include_Bvac_div_2: Bplasma_vac = Bplasma_vac + vac_eval_data["B"] / 2 # remove this?
             Bplasma = Bplasma - Bplasma_vac
 
         x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
