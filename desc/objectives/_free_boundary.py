@@ -770,6 +770,7 @@ class BoundaryError(_Objective):
         "_sheet_data_keys",
         "_use_same_grid",
         "_vac_eq_data_keys",
+        "_include_Bvac_div_2",
     ]
 
     _scalar = False
@@ -797,6 +798,7 @@ class BoundaryError(_Objective):
         field_grid=None,
         field_fixed=False,
         vacuum_eq=None,
+        include_Bvac_div_2=True,
         name="Boundary error",
         jac_chunk_size=None,
         *,
@@ -820,6 +822,7 @@ class BoundaryError(_Objective):
             B_plasma_chunk_size = None
         self._B_plasma_chunk_size = B_plasma_chunk_size
         self._sheet_current = hasattr(eq.surface, "Phi_mn")
+        self._include_Bvac_div_2 = include_Bvac_div_2
         self._has_vacuum_eq = vacuum_eq is not None
         things = [eq]
         if self._has_vacuum_eq:
@@ -1147,7 +1150,7 @@ class BoundaryError(_Objective):
                 constants["interpolator"],
                 chunk_size=self._B_plasma_chunk_size,
             )
-            Bplasma_vac = Bplasma_vac + vac_eval_data["B"] / 2
+            if self._include_Bvac_div_2: Bplasma_vac = Bplasma_vac + vac_eval_data["B"] / 2
             Bplasma = Bplasma - Bplasma_vac
 
         x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
