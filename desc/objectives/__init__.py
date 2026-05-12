@@ -18,7 +18,8 @@ from ._coils import (
     SurfaceCurrentRegularization,
     SurfaceQuadraticFlux,
     ToroidalFlux,
-    FieldNormalError
+    FieldNormalError,
+    FieldOnCurve,
 )
 from ._equilibrium import (
     CurrentDensity,
