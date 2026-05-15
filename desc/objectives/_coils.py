@@ -1543,6 +1543,112 @@ class CoilArclengthVariance(_CoilObjective):
         data = tree_leaves(data, is_leaf=lambda x: isinstance(x, dict))
         out = jnp.array([jnp.var(jnp.linalg.norm(dat["x_s"], axis=1)) for dat in data])
         return (out * constants["mask"])[self._coilset_tree["coilset_mask"]]
+    
+
+class CoilChargeTime(_CoilObjective):
+    """Proxy for coil charge time.
+
+    For shaping coils, the maximum current carried by the coil
+    determines the stack height and therefore the coil inductance
+    and radial resistance. This objective computes a proxy for charge
+    time and tries to minimize it.
+
+    Parameters
+    ----------
+    coil : CoilSet or Coil
+        Coil(s) that are to be optimized
+    softmin_sigma : float or None
+        Weighting to use for softmin. If None, then all charge times
+        are minimized simultaneously.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.", bounds_default="``target=0``.", coil=True
+    )
+
+    _static_attrs = _Objective._static_attrs + [
+        "_softmin_alpha",
+    ]
+
+    _scalar = False  # Not always a scalar, if a coilset is passed in
+    _units = "~"
+    _print_value_fmt = "Coil charge time proxy: "
+    _broadcast_input = "Coil"
+
+    def __init__(
+        self,
+        coils,
+        softmin_alpha=None,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        name="coil charge time proxy",
+    ):
+        if target is None and bounds is None:
+            target = 0
+
+        self._softmin_alpha = softmin_alpha
+
+        super().__init__(
+            coils,
+            ["current"],
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        super().build(use_jit=use_jit, verbose=verbose)
+
+        self._constants["initial_current"] = self.things[0].compute(["current"])["current"]
+
+        if self._normalize:
+            self._normalization = np.mean([self._constants["initial_current"] ** 2])
+
+        _Objective.build(self, use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute coil charge time proxy.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of the coil's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants.
+
+        Returns
+        -------
+        f : float or array of floats
+            Coil arclength variance.
+        """
+        if constants is None:
+            constants = self.constants
+        data = super().compute(params, constants=constants)
+        charge_time = jnp.maximum(jnp.abs(data["current"]), jnp.abs(constants["initial_current"])) * (data["current"] - constants["initial_current"])
+        if self._softmin_alpha is not None: charge_time = softmin(jnp.abs(charge_time), self._softmin_alpha)
+        return charge_time
 
 
 class QuadraticFlux(_Objective):
