@@ -1607,8 +1607,7 @@ class FixSumModesR(_FixedObjective):
             modes = np.atleast_2d(eq.R_basis.modes[idx, :])
             if self._sum_weights is not None:
                 self._sum_weights = np.atleast_1d(self._sum_weights)
-                if self._sum_weights.shape[0] != modes_idx.shape[0]:
-                    self._sum_weights = self._sum_weights[modes_idx]
+                self._sum_weights = self._sum_weights[modes_idx]
             if idx.size < modes.shape[0]:
                 warnings.warn(
                     colored(
@@ -1775,8 +1774,7 @@ class FixSumModesZ(_FixedObjective):
             modes = np.atleast_2d(eq.Z_basis.modes[idx, :])
             if self._sum_weights is not None:
                 self._sum_weights = np.atleast_1d(self._sum_weights)
-                if self._sum_weights.shape[0] != modes_idx.shape[0]:
-                    self._sum_weights = self._sum_weights[modes_idx]
+                self._sum_weights = self._sum_weights[modes_idx]
 
             if idx.size < modes.shape[0]:
                 warnings.warn(
