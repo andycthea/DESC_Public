@@ -2382,6 +2382,212 @@ class Bxdl(_Objective):
 # NEW BXDL CODE
 
 
+class FieldOnCurve(_Objective):
+    """Target |B| = target on a curve. Useful for vacuum axis field magnitude
+
+    Computes field from MagneticField object(s), and optimizes them to produce a field
+    which is target magnitude on a given Curve object.
+
+    Parameters
+    ----------
+    curve : Curve
+        Curve along which magnetic field will be optimized.
+    field : MagneticField
+        External field produced by coils or other source, which will be optimized to
+        minimize the perpendicular component to the Curve.
+    eval_grid : Grid, optional
+        Collocation grid for the points to evaluate the objective at on the curve.
+        Default grid is determined by the Curve object.
+    field_grid : Grid, optional
+        Grid used to discretize field (e.g. grid for the magnetic field source from
+        coils). Default grid is determined by the specific MagneticField object, see
+        the docs of that object's ``compute_magnetic_field`` method for more detail.
+    bs_chunk_size : int or None
+        Size to split Biot-Savart computation into chunks of evaluation points.
+        If no chunking should be done or the chunk size is the full input
+        then supply ``None``.
+    field_fixed : bool, optional
+        Whether to fix the field's DOFs during the optimization. Default is False.
+    curve_fixed : bool, optional
+        Whether to fix the curve's DOFs during the optimization. Default is True.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.",
+        bounds_default="``target=0``.",
+    )
+
+    _scalar = False
+    _linear = False
+    _print_value_fmt = "Curve |B| error: "
+    _units = "(T)"
+    _coordinates = "rtz"
+
+    _static_attrs = _Objective._static_attrs + [
+        "_bs_chunk_size",
+        "_field_fixed",
+        "_curve_fixed",
+    ]
+
+    def __init__(
+        self,
+        curve,
+        field,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        eval_grid=None,
+        field_grid=None,
+        name="FieldOnCurve",
+        jac_chunk_size=None,
+        *,
+        bs_chunk_size=None,
+        field_fixed=False,
+        curve_fixed=True,
+        **kwargs,
+    ):
+
+        if target is None and bounds is None:
+            target = 0
+
+        self._eval_grid = eval_grid
+        self._curve = curve
+        self._field = [field] if not isinstance(field, list) else field
+        self._field_grid = field_grid
+        self._bs_chunk_size = bs_chunk_size
+        things = []
+        self._field_fixed = field_fixed
+        self._curve_fixed = curve_fixed
+
+        if not field_fixed:
+            things += self._field
+        if not curve_fixed:
+            things += [self._curve]
+
+        errorif(
+            curve_fixed and field_fixed,
+            ValueError,
+            "Cannot have all `curve_fixed` and `field_fixed` set to True. "
+            "At least one of them must be False.",
+        )
+
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        from desc.grid import QuadratureGrid
+        from desc.magnetic_fields import SumMagneticField
+
+        curve = self._curve
+
+        if self._eval_grid is None:
+            eval_grid = LinearGrid(N=2 * curve.N + 5)
+            self._eval_grid = eval_grid
+        else:
+            eval_grid = self._eval_grid
+
+        self._data_keys = ["R", "Z", "phi", "ds"]
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+        if self._curve_fixed:
+            eval_data = curve.compute(self._data_keys, grid=eval_grid, basis="rpz")
+        else:
+            eval_data = curve.compute("ds", grid=eval_grid, basis="rpz")
+        self._dim_f = eval_grid.num_nodes
+        w = eval_data["ds"]
+
+        self._constants = {
+            "field": SumMagneticField(self._field),
+            "field_grid": self._field_grid,
+            "quad_weights": w,
+            "eval_data": eval_data,
+        }
+
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        if self._normalize:
+            self._normalization = 1
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, *params, constants=None):
+        """Compute |B| error on curve.
+
+        Parameters
+        ----------
+        field_params : dict
+            Dictionary of the external field's and/or the curve's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants
+
+        Returns
+        -------
+        f : ndarray
+            |B| error at points
+
+        """
+        from desc.utils import cross
+
+        # Use an index to track the end of the main parameters
+        end_index = len(params)
+
+        # Conditionally extract items from the end of the tuple
+        if not self._curve_fixed:
+            curve_params = params[end_index - 1]
+            end_index -= 1
+        if not self._field_fixed:
+            field_params = params[:end_index]
+
+        if constants is None:
+            constants = self.constants
+        if self._curve_fixed:
+            eval_data = constants["eval_data"]
+        else:
+            eval_data = self._curve.compute(
+                self._data_keys, grid=self._eval_grid, basis="rpz", params=curve_params
+            )
+        x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
+
+        # B_ext is not pre-computed because field is not fixed typically
+
+        B_ext = constants["field"].compute_magnetic_field(
+            x,
+            source_grid=constants["field_grid"],
+            basis="rpz",
+            params=field_params if not self._field_fixed else None,
+            chunk_size=self._bs_chunk_size,
+        )
+        f = safenorm(B_ext, axis=-1)
+        return f
+
+
 # NEW Divertor legs CODE
 # From two curves (X point and a footpoint curve),
 # constructs a plane between them and computes quadrature points and normals
