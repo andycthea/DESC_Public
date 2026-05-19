@@ -1513,3 +1513,109 @@ class MirrorRatio(_Objective):
             profiles=constants["profiles"],
         )
         return constants["transforms"]["grid"].compress(data["mirror ratio"])
+
+class SurfaceArclengthVariance(_Objective):
+    """Variance of ||dx/ds|| along the surface in the poloidal direction.
+
+    This objective is meant to combat any issues corresponding to non-uniqueness of
+    the representation of a surface, in that the same physical surface can be represented
+    by different parametrizations.
+
+    Parameters
+    ----------
+    surface : FourierRZToroidalSurface
+    grid : Grid, optional
+        Collocation grid containing the nodes to evaluate at.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.", bounds_default="``target=0``.", coil=True
+    )
+
+    _scalar = False  # Not always a scalar, if a coilset is passed in
+    _units = "(m^2)"
+    _print_value_fmt = "Surface Arclength Variance: "
+
+    def __init__(
+        self,
+        surface,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="surface arclength variance",
+    ):
+        if target is None and bounds is None:
+            target = 0
+
+        assert isinstance(grid, LinearGrid), "grid needs to be a LinearGrid instance"
+        self._grid = grid
+
+        super().__init__(
+            things=surface,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        self._dim_f = self._grid.N*2+1 # TODO: make this more robust
+        self._data_keys = ["e_theta"]
+
+        if self._normalize:
+            self._normalization = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(self.things[0].compute(["e_theta"], grid=self._grid)["e_theta"], axis=-1), order="rtz")[0], axis=-1).mean()
+
+        self._constants = {
+            "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
+            "profiles": get_profiles(self._data_keys, obj=self.things[0], grid=self._grid),
+        }
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute coil arclength variance.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of the coil's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants.
+
+        Returns
+        -------
+        f : float or array of floats
+            Coil arclength variance.
+        """
+        if constants is None:
+            constants = self.constants
+        data = compute_fun(
+            "desc.geometry.surface.FourierRZToroidalSurface",
+            ["e_theta"],
+            params=params,
+            transforms=constants["transforms"],
+            profiles=constants["profiles"],
+        )
+        out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=-1)
+        return out

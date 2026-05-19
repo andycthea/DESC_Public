@@ -2833,6 +2833,7 @@ def plot_coils(coils, grid=None, fig=None, return_data=False, **kwargs):
     """
     lw = kwargs.pop("lw", 5)
     ls = kwargs.pop("ls", "solid")
+    opacity = kwargs.pop("opacity", 1.0)
     figsize = kwargs.pop("figsize", (10, 10))
     color = kwargs.pop("color", "black")
     unique = kwargs.pop("unique", False)
@@ -2855,6 +2856,8 @@ def plot_coils(coils, grid=None, fig=None, return_data=False, **kwargs):
         lw = [lw]
     if not isinstance(ls, (list, tuple)):
         ls = [ls]
+    if not isinstance(opacity, (list, tuple)):
+        opacity = [opacity]
     if not isinstance(color, (list, tuple)):
         color = [color]
     if grid is None:
@@ -2907,6 +2910,7 @@ def plot_coils(coils, grid=None, fig=None, return_data=False, **kwargs):
             showlegend=False,
             name=coil.name or f"CoilSet[{i}]",
             hovertext=f"Current = {current} (A)",
+            opacity=opacity[i % len(opacity)],
         )
 
         fig.add_trace(trace)

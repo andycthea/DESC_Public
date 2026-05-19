@@ -20,6 +20,7 @@ from ._coils import (
     ToroidalFlux,
     FieldNormalError,
     FieldOnCurve,
+    CoilChargeTime,
 )
 from ._equilibrium import (
     CurrentDensity,
@@ -47,6 +48,7 @@ from ._geometry import (
     PlasmaVesselDistance,
     PrincipalCurvature,
     Volume,
+    SurfaceArclengthVariance,
 )
 from ._neoclassical import EffectiveRipple
 from ._omnigenity import (

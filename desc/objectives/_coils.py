@@ -19,6 +19,7 @@ from desc.utils import (
     errorif,
     rpz2xyz,
     safenorm,
+    safediv,
     setdefault,
     warnif,
 )
@@ -1545,7 +1546,7 @@ class CoilArclengthVariance(_CoilObjective):
         return (out * constants["mask"])[self._coilset_tree["coilset_mask"]]
     
 
-class CoilChargeTime(_CoilObjective):
+class CoilChargeTime(_Objective):
     """Proxy for coil charge time.
 
     For shaping coils, the maximum current carried by the coil
@@ -1557,8 +1558,8 @@ class CoilChargeTime(_CoilObjective):
     ----------
     coil : CoilSet or Coil
         Coil(s) that are to be optimized
-    softmin_sigma : float or None
-        Weighting to use for softmin. If None, then all charge times
+    softmax_alpha : float or None
+        Weighting to use for softmax. If None, then all charge times
         are minimized simultaneously.
 
     """
@@ -1568,18 +1569,17 @@ class CoilChargeTime(_CoilObjective):
     )
 
     _static_attrs = _Objective._static_attrs + [
-        "_softmin_alpha",
+        "_softmax_alpha",
     ]
 
     _scalar = False  # Not always a scalar, if a coilset is passed in
     _units = "~"
     _print_value_fmt = "Coil charge time proxy: "
-    _broadcast_input = "Coil"
 
     def __init__(
         self,
         coils,
-        softmin_alpha=None,
+        softmax_alpha=None,
         target=None,
         bounds=None,
         weight=1,
@@ -1592,11 +1592,11 @@ class CoilChargeTime(_CoilObjective):
         if target is None and bounds is None:
             target = 0
 
-        self._softmin_alpha = softmin_alpha
+        self._softmax_alpha = softmax_alpha
+        self._coils = coils
 
         super().__init__(
-            coils,
-            ["current"],
+            things=[coils],
             target=target,
             bounds=bounds,
             weight=weight,
@@ -1618,14 +1618,24 @@ class CoilChargeTime(_CoilObjective):
             Level of output.
 
         """
-        super().build(use_jit=use_jit, verbose=verbose)
 
-        self._constants["initial_current"] = self.things[0].compute(["current"])["current"]
+        self._constants = {
+            "initial_current": np.array(self.things[0].current.copy()).flatten(),
+            "quad_weights": 1.0,
+        }
+
+        self._dim_f = self._constants["initial_current"].shape[0]
+        if self._softmax_alpha is not None: self._dim_f = 1
+
+        all_params = tree_map(lambda dim: np.arange(dim), self.things[0].dimensions)
+        current_params = tree_map(lambda idx: {"current": idx}, True)
+        # indices of coil currents
+        self._indices = tree_leaves(broadcast_tree(current_params, all_params))
 
         if self._normalize:
             self._normalization = np.mean([self._constants["initial_current"] ** 2])
 
-        _Objective.build(self, use_jit=use_jit, verbose=verbose)
+        super().build(use_jit=use_jit, verbose=verbose)
 
     def compute(self, params, constants=None):
         """Compute coil charge time proxy.
@@ -1645,9 +1655,9 @@ class CoilChargeTime(_CoilObjective):
         """
         if constants is None:
             constants = self.constants
-        data = super().compute(params, constants=constants)
-        charge_time = jnp.maximum(jnp.abs(data["current"]), jnp.abs(constants["initial_current"])) * (data["current"] - constants["initial_current"])
-        if self._softmin_alpha is not None: charge_time = softmin(jnp.abs(charge_time), self._softmin_alpha)
+        coil_currents = jnp.array([p["current"] for p in params]).flatten()
+        charge_time = jnp.maximum(jnp.abs(coil_currents), jnp.abs(constants["initial_current"])) * (coil_currents - constants["initial_current"])
+        if self._softmax_alpha is not None: charge_time = softmax(jnp.abs(charge_time), self._softmax_alpha)
         return charge_time
 
 
@@ -2375,7 +2385,7 @@ class Bxdl(_Objective):
                 **self._eq_kwargs,
             )
             B_ext = B_ext + B_plasma
-        f = safenorm(cross(B_ext, eval_data["frenet_tangent"], axis=-1), axis=-1)
+        f = safediv(safenorm(cross(B_ext, eval_data["frenet_tangent"], axis=-1), axis=-1), (B_ext * eval_data["frenet_tangent"]).sum(axis=-1))
         return f
 
 
