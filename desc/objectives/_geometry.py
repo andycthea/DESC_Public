@@ -1580,15 +1580,18 @@ class SurfaceArclengthVariance(_Objective):
 
         """
         self._dim_f = self._grid.N*2+1 # TODO: make this more robust
-        self._data_keys = ["e_theta"]
+        self._data_keys = ["e_theta", "R_t", "Z_t"]
 
         if self._normalize:
             self._normalization = 1.0
 
+        data = self.things[0].compute(self._data_keys, grid=self._grid)
+        lengths = self._grid.meshgrid_reshape(np.linalg.norm(np.c_[data["R_t"], data["R_t"]]), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+
         self._constants = {
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
             "profiles": get_profiles(self._data_keys, obj=self.things[0], grid=self._grid),
-            "norm": jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(self.things[0].compute(["e_theta"], grid=self._grid)["e_theta"], axis=-1), order="rtz")[0], axis=0)
+            "norm": jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=-1), order="rtz")[0], axis=0) / lengths
         }
 
         super().build(use_jit=use_jit, verbose=verbose)
@@ -1613,13 +1616,15 @@ class SurfaceArclengthVariance(_Objective):
             constants = self.constants
         data = compute_fun(
             "desc.geometry.surface.FourierRZToroidalSurface",
-            ["e_theta"],
+            ["e_theta", "R_t", "Z_t"],
             params=params,
             transforms=constants["transforms"],
             profiles=constants["profiles"],
         )
+        data = self.things[0].compute(self._data_keys, grid=self._grid)
+        lengths = self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["R_t"]]), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
         out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=0)
-        return out / constants["norm"]
+        return out / lengths / constants["norm"]
     
 class CurveToCurveDistance(_Objective):
     """Distance between a free curve and a fixed curve.
