@@ -1586,7 +1586,7 @@ class SurfaceArclengthVariance(_Objective):
             self._normalization = 1.0
 
         data = self.things[0].compute(self._data_keys, grid=self._grid)
-        lengths = self._grid.meshgrid_reshape(np.linalg.norm(np.c_[data["R_t"], data["R_t"]]), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+        lengths = self._grid.meshgrid_reshape(np.linalg.norm(np.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
 
         self._constants = {
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
@@ -1622,7 +1622,7 @@ class SurfaceArclengthVariance(_Objective):
             profiles=constants["profiles"],
         )
         data = self.things[0].compute(self._data_keys, grid=self._grid)
-        lengths = self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["R_t"]]), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+        lengths = self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
         out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=0)
         return out / lengths / constants["norm"]
     
