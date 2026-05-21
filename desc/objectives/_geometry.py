@@ -1621,8 +1621,7 @@ class SurfaceArclengthVariance(_Objective):
             transforms=constants["transforms"],
             profiles=constants["profiles"],
         )
-        data = self.things[0].compute(self._data_keys, grid=self._grid)
-        lengths = self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+        lengths = jnp.sum(self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0], axis=0) / (self._grid.M*2+1) * jnp.pi * 2
         out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=0)
         return out / lengths / constants["norm"]
     
