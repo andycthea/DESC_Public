@@ -1583,11 +1583,12 @@ class SurfaceArclengthVariance(_Objective):
         self._data_keys = ["e_theta"]
 
         if self._normalize:
-            self._normalization = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(self.things[0].compute(["e_theta"], grid=self._grid)["e_theta"], axis=-1), order="rtz")[0], axis=0).mean()
+            self._normalization = 1.0
 
         self._constants = {
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
             "profiles": get_profiles(self._data_keys, obj=self.things[0], grid=self._grid),
+            "norm": jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(self.things[0].compute(["e_theta"], grid=self._grid)["e_theta"], axis=-1), order="rtz")[0], axis=0)
         }
 
         super().build(use_jit=use_jit, verbose=verbose)
@@ -1618,7 +1619,7 @@ class SurfaceArclengthVariance(_Objective):
             profiles=constants["profiles"],
         )
         out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=0)
-        return out
+        return out / constants["norm"]
     
 class CurveToCurveDistance(_Objective):
     """Distance between a free curve and a fixed curve.
