@@ -1583,7 +1583,7 @@ class SurfaceArclengthVariance(_Objective):
         self._data_keys = ["e_theta"]
 
         if self._normalize:
-            self._normalization = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(self.things[0].compute(["e_theta"], grid=self._grid)["e_theta"], axis=-1), order="rtz")[0], axis=-1).mean()
+            self._normalization = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(self.things[0].compute(["e_theta"], grid=self._grid)["e_theta"], axis=-1), order="rtz")[0], axis=0).mean()
 
         self._constants = {
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
@@ -1617,5 +1617,115 @@ class SurfaceArclengthVariance(_Objective):
             transforms=constants["transforms"],
             profiles=constants["profiles"],
         )
-        out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=-1)
+        out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=0)
         return out
+    
+class CurveToCurveDistance(_Objective):
+    """Distance between a free curve and a fixed curve.
+
+    Parameters
+    ----------
+    curve_free : Curve
+    curve_fixed : Curve
+    grid : Grid, optional
+        Collocation grid containing the nodes to evaluate at.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.", bounds_default="``target=0``.", coil=True
+    )
+
+    _static_attrs = _Objective._static_attrs + [
+        "_curve_fixed",
+    ]
+
+    _scalar = False  # Not always a scalar, if a coilset is passed in
+    _units = "(m^2)"
+    _print_value_fmt = "Curve to Curve distance: "
+
+    def __init__(
+        self,
+        curve_free,
+        curve_fixed,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="curve to curve distance",
+    ):
+        if target is None and bounds is None:
+            target = 0
+
+        self._grid = grid
+        self._curve_fixed = curve_fixed
+        self._curve_free = curve_free
+
+        super().__init__(
+            things=curve_free,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        self._dim_f = self._grid.nodes.shape[0] # TODO: make this more robust
+        self._data_keys = ["R", "Z"]
+
+        data_fixed = self._curve_fixed.compute(["R", "Z"], grid=self._grid)
+        if self._normalize:
+            data_free = self._curve_free.compute(["R", "Z"], grid=self._grid)
+            self._normalization = jnp.linalg.norm(jnp.c_[data_fixed["R"], data_fixed["Z"]]-jnp.c_[data_free["R"], data_free["Z"]], axis=-1).mean()
+
+        self._constants = {
+            "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
+            "profiles": get_profiles(self._data_keys, obj=self.things[0], grid=self._grid),
+            "R_fixed": data_fixed["R"],
+            "Z_fixed": data_fixed["Z"],
+        }
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute coil arclength variance.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of the coil's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants.
+
+        Returns
+        -------
+        f : float or array of floats
+            Coil arclength variance.
+        """
+        if constants is None:
+            constants = self.constants
+        data = self._curve_free.compute(
+            ["R", "Z"],
+            params=params,
+            transforms=constants["transforms"],
+        )
+        return jnp.linalg.norm(jnp.c_[data["R"], data["Z"]] - jnp.c_[constants["R_fixed"], constants["Z_fixed"]], axis=-1)

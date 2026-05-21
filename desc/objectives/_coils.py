@@ -2385,7 +2385,7 @@ class Bxdl(_Objective):
                 **self._eq_kwargs,
             )
             B_ext = B_ext + B_plasma
-        f = safediv(safenorm(cross(B_ext, eval_data["frenet_tangent"], axis=-1), axis=-1), (B_ext * eval_data["frenet_tangent"]).sum(axis=-1))
+        f = safenorm(cross(B_ext, eval_data["frenet_tangent"], axis=-1), axis=-1)
         return f
 
 

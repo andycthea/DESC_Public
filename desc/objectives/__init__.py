@@ -49,6 +49,7 @@ from ._geometry import (
     PrincipalCurvature,
     Volume,
     SurfaceArclengthVariance,
+    CurveToCurveDistance,
 )
 from ._neoclassical import EffectiveRipple
 from ._omnigenity import (
