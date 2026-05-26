@@ -50,6 +50,7 @@ from ._geometry import (
     Volume,
     SurfaceArclengthVariance,
     CurveToCurveDistance,
+    SurfacePoloidalCircumference,
 )
 from ._neoclassical import EffectiveRipple
 from ._omnigenity import (

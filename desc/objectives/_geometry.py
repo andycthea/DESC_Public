@@ -1625,6 +1625,111 @@ class SurfaceArclengthVariance(_Objective):
         out = jnp.var(self._grid.meshgrid_reshape(jnp.linalg.norm(data["e_theta"], axis=1), order="rtz")[0], axis=0)
         return out / lengths / constants["norm"]
     
+class SurfacePoloidalCircumference(_Objective):
+    """Circumference around the surface in the poloidal direction.
+
+    This objective is meant to help generate vacuum flux surface boundaries.
+
+    Parameters
+    ----------
+    surface : FourierRZToroidalSurface
+    grid : Grid, optional
+        Collocation grid containing the nodes to evaluate at.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.", bounds_default="``target=0``.", coil=True
+    )
+
+    _scalar = False  # Not always a scalar, if a coilset is passed in
+    _units = "(m^2)"
+    _print_value_fmt = "Surface Poloidal Circumference: "
+
+    def __init__(
+        self,
+        surface,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="surface poloidal circumgerence",
+    ):
+        if target is None and bounds is None:
+            target = 0
+
+        assert isinstance(grid, LinearGrid), "grid needs to be a LinearGrid instance"
+        self._grid = grid
+
+        super().__init__(
+            things=surface,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        self._dim_f = self._grid.N*2+1 # TODO: make this more robust
+        self._data_keys = ["R_t", "Z_t"]
+
+        data = self.things[0].compute(self._data_keys, grid=self._grid)
+        lengths = self._grid.meshgrid_reshape(np.linalg.norm(np.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+        if self._normalize:
+            self._normalization = lengths.mean()
+
+
+        self._constants = {
+            "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
+        }
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute surface circumferences.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of the coil's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants.
+
+        Returns
+        -------
+        f : float or array of floats
+            Coil arclength variance.
+        """
+        if constants is None:
+            constants = self.constants
+        data = compute_fun(
+            "desc.geometry.surface.FourierRZToroidalSurface",
+            ["R_t", "Z_t"],
+            params=params,
+            transforms=constants["transforms"],
+        )
+        lengths = jnp.sum(self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0], axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+        return lengths
+    
 class CurveToCurveDistance(_Objective):
     """Distance between a free curve and a fixed curve.
 
