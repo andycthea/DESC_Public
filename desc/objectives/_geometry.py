@@ -1649,6 +1649,7 @@ class SurfacePoloidalCircumference(_Objective):
     def __init__(
         self,
         surface,
+        normalized_to_initial=True,
         target=None,
         bounds=None,
         weight=1,
@@ -1661,6 +1662,8 @@ class SurfacePoloidalCircumference(_Objective):
     ):
         if target is None and bounds is None:
             target = 0
+
+        self._normalized_to_initial = normalized_to_initial # TODO: add to static params
 
         assert isinstance(grid, LinearGrid), "grid needs to be a LinearGrid instance"
         self._grid = grid
@@ -1694,11 +1697,13 @@ class SurfacePoloidalCircumference(_Objective):
         data = self.things[0].compute(self._data_keys, grid=self._grid)
         lengths = self._grid.meshgrid_reshape(np.linalg.norm(np.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
         if self._normalize:
-            self._normalization = lengths.mean()
+            if self._normalized_to_initial: self._normalization = 1.0
+            else: self._normalization = lengths.mean()
 
 
         self._constants = {
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
+            "lengths": lengths,
         }
 
         super().build(use_jit=use_jit, verbose=verbose)
@@ -1728,7 +1733,8 @@ class SurfacePoloidalCircumference(_Objective):
             transforms=constants["transforms"],
         )
         lengths = jnp.sum(self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0], axis=0) / (self._grid.M*2+1) * jnp.pi * 2
-        return lengths
+        if self._normalized_to_initial: return lengths / constants["lengths"]
+        else: return lengths
     
 class CurveToCurveDistance(_Objective):
     """Distance between a free curve and a fixed curve.
