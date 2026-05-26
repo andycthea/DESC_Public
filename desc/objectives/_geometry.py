@@ -1667,6 +1667,7 @@ class SurfacePoloidalCircumference(_Objective):
 
         assert isinstance(grid, LinearGrid), "grid needs to be a LinearGrid instance"
         self._grid = grid
+        self._surface = surface
 
         super().__init__(
             things=surface,
@@ -1726,8 +1727,7 @@ class SurfacePoloidalCircumference(_Objective):
         """
         if constants is None:
             constants = self.constants
-        data = compute_fun(
-            "desc.geometry.surface.FourierRZToroidalSurface",
+        data = self._surface.compute(
             ["R_t", "Z_t"],
             params=params,
             transforms=constants["transforms"],
