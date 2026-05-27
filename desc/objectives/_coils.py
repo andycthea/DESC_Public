@@ -2061,7 +2061,7 @@ class SurfaceQuadraticFlux(_Objective):
             scales = compute_scaling_factors(surface)
             Bscale = 1.0  # surface has no inherent B scale
             self._normalization = Bscale * scales["R0"] * scales["a"]
-            if self._normalize_g_mag: self._normalization = self._normalization * jnp.sqrt(eval_data["|e_theta x e_zeta|"]).sum()
+            if self._normalize_g_mag: self._normalization = self._normalization / jnp.sqrt(eval_data["|e_theta x e_zeta|"]).sum()
 
         super().build(use_jit=use_jit, verbose=verbose)
 
