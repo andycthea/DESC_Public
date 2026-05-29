@@ -18,7 +18,7 @@ from desc.utils import (
 
 from .normalization import compute_scaling_factors
 from .objective_funs import _Objective, collect_docs
-from .utils import check_if_points_are_inside_perimeter, softmin
+from .utils import check_if_points_are_inside_perimeter, softmin, softmax
 
 
 class AspectRatio(_Objective):
@@ -1704,6 +1704,7 @@ class SurfacePoloidalCircumference(_Objective):
 
         self._constants = {
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
+            "profiles": get_profiles(self._data_keys, obj=self.things[0], grid=self._grid),
             "lengths": lengths,
         }
 
@@ -1727,10 +1728,12 @@ class SurfacePoloidalCircumference(_Objective):
         """
         if constants is None:
             constants = self.constants
-        data = self._surface.compute(
+        data = compute_fun(
+            "desc.geometry.surface.FourierRZToroidalSurface",
             ["R_t", "Z_t"],
             params=params,
             transforms=constants["transforms"],
+            profiles=constants["profiles"],
         )
         lengths = jnp.sum(self._grid.meshgrid_reshape(jnp.linalg.norm(jnp.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0], axis=0) / (self._grid.M*2+1) * jnp.pi * 2
         if self._normalized_to_initial: return lengths / constants["lengths"]
@@ -1845,3 +1848,279 @@ class CurveToCurveDistance(_Objective):
             transforms=constants["transforms"],
         )
         return jnp.linalg.norm(jnp.c_[data["R"], data["Z"]] - jnp.c_[constants["R_fixed"], constants["Z_fixed"]], axis=-1)
+
+
+class EquilibriumToCurveDistanceBound(_Objective):
+    """Target the distance between the plasma and a curve.
+
+
+    NOTE: By default, assumes the plasma boundary is not fixed and its coordinates are
+    computed at every iteration, for example if the equilibrium is changing in a
+    single-stage optimization.
+    If the plasma boundary is fixed, set eq_fixed=True to precompute the last closed
+    flux surface coordinates and improve the efficiency of the calculation.
+
+    Parameters
+    ----------
+    eq : Equilibrium or FourierRZToroidalSurface
+        Equilibrium (or FourierRZToroidalSurface) that will be optimized
+        to satisfy the Objective.
+    curve : CoilSet
+        Curve that is to be optimized.
+    plasma_grid : Grid, optional
+        Collocation grid containing the nodes to evaluate plasma geometry at.
+        Defaults to ``LinearGrid(M=eq.M_grid, N=eq.N_grid)``.
+    curve_grid : Grid, list, optional
+        Collocation grid containing the nodes to evaluate coilset geometry at.
+        Defaults to the default grid for the given coil-type, see ``coils.py``
+        and ``curve.py`` for more details.
+        If a list, must have the same structure as coils.
+    eq_fixed: bool, optional
+        Whether the equilibrium is fixed or not. If True, the last closed flux surface
+        is fixed and its coordinates are precomputed, which saves on computation time
+        during optimization, and self.things = [coil] only.
+        If False, the surface coordinates are computed at every iteration.
+        False by default, so that self.things = [coil, eq].
+    curve_fixed: bool, optional
+        Whether the coils are fixed or not. If True, the coils
+        are fixed and their coordinates are precomputed, which saves on computation time
+        during optimization, and self.things = [eq] only.
+        If False, the coil coordinates are computed at every iteration.
+        False by default, so that self.things = [coil, eq].
+    use_softmin: bool, optional
+        Use softmin (softmax) or hard min (max). Softmin is a smooth approximation to
+        the actual minimum distance that may give smoother gradients, at the expense of
+        being slightly more expensive and only an approximate extremum.
+    softmin_alpha: float, optional
+        Parameter used for softmin. The larger ``softmin_alpha``, the closer the
+        softmin (softmax) approximates the hardmin (hardmax). softmin -> hardmin as
+        ``softmin_alpha`` -> infinity.
+    dist_chunk_size : int > 0, optional
+        When computing distances, how many coils to consider at once. Default is all
+        coils, which is generally the fastest but requires the most memory. If there are
+        a large number of coils, or if the resolution is very high, setting this to a
+        small value will reduce peak memory usage at the cost of slightly increased
+        runtime.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``bounds=(0,1)``.",
+        bounds_default="``bounds=(0,1)``.",
+        coil=True,
+    )
+    _static_attrs = _Objective._static_attrs + [
+        "_mode",
+        "_eq_fixed",
+        "_curve_fixed",
+        "_use_softmin",
+        "_dist_chunk_size",
+        "_max_dist_per_phi"
+    ]
+
+    _scalar = False
+    _units = "(m)"
+    _print_value_fmt = "Plasma-curve distance: "
+
+    def __init__(
+        self,
+        eq,
+        curve,
+        max_dist_per_phi,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        plasma_grid=None,
+        curve_grid=None,
+        eq_fixed=False,
+        curve_fixed=False,
+        name="plasma-curve distance",
+        jac_chunk_size=None,
+        use_softmin=False,
+        softmin_alpha=1.0,
+        dist_chunk_size=None,
+    ):
+        if target is None and bounds is None:
+            target = 0.0
+
+        self._eq = eq
+        self._curve = curve
+        self._max_dist_per_phi = max_dist_per_phi
+        self._plasma_grid = plasma_grid
+        self._curve_grid = curve_grid
+        self._eq_fixed = eq_fixed
+        self._curve_fixed = curve_fixed
+        self._use_softmin = use_softmin
+        self._softmin_alpha = softmin_alpha
+        self._dist_chunk_size = dist_chunk_size
+        errorif(eq_fixed and curve_fixed, ValueError, "Cannot fix both eq and coil")
+        things = []
+        if not eq_fixed:
+            things.append(eq)
+        if not curve_fixed:
+            things.append(curve)
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        if self._eq_fixed:
+            eq = self._eq
+            curve = self.things[0]
+        elif self._curve_fixed:
+            eq = self.things[0]
+            curve = self._curve
+        else:
+            eq = self.things[0]
+            curve = self.things[1]
+        default_M = 2 * eq.M if not hasattr(eq, "_M_grid") else eq.M_grid
+        default_N = 2 * eq.N if not hasattr(eq, "_M_grid") else eq.N_grid
+        plasma_grid = self._plasma_grid or LinearGrid(
+            M=default_M, N=default_N, NFP=eq.NFP, rho=[1.0]
+        )
+        curve_grid = self._curve_grid or None
+        warnif(
+            not np.allclose(plasma_grid.nodes[:, 0], 1),
+            UserWarning,
+            "Plasma/Surface grid includes interior points, should be rho=1.",
+        )
+
+        errorif(
+            not (plasma_grid.N == curve_grid.N) and (plasma_grid.NFP == curve_grid.NFP),
+            ValueError,
+            f"eq and curve grids should have same N and NFP",
+        )
+
+        self._dim_f = curve_grid.N*2+1
+        self._data_keys = ["R", "Z"]
+
+        eq_profiles = get_profiles(self._data_keys, obj=eq, grid=plasma_grid)
+        eq_transforms = get_transforms(self._data_keys, obj=eq, grid=plasma_grid)
+
+        self._constants = {
+            "eq": eq,
+            "curve": curve,
+            "curve_grid": curve_grid,
+            "eq_profiles": eq_profiles,
+            "eq_transforms": eq_transforms,
+            "quad_weights": 1.0,
+            "max_dist_per_phi": self._max_dist_per_phi,
+        }
+
+        if self._eq_fixed:
+            # precompute the equilibrium surface coordinates
+            data = compute_fun(
+                eq,
+                self._data_keys,
+                params=eq.params_dict,
+                transforms=eq_transforms,
+                profiles=eq_profiles,
+            )
+            plasma_coords = jnp.c_[data["R"], data["Z"]]
+            plasma_coords = plasma_grid.meshgrid_reshape(plasma_coords, "rtz")[0]
+            self._constants["plasma_coords"] = plasma_coords
+        if self._curve_fixed:
+            data = curve.compute(["R", "Z"], grid=curve_grid, params=curve.params_dict)
+            curve_coords = jnp.c_[data["R"], data["Z"]]
+            curve_coords = curve_grid.meshgrid_reshape(curve_coords, "rtz")[0,0]
+            self._constants["curve_coords"] = curve_coords
+
+        if self._normalize:
+            scales = compute_scaling_factors(eq)
+            self._normalization = scales["a"]
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params_1, params_2=None, constants=None):
+        """Compute minimum/maximum distance between coils and the plasma/surface.
+
+        Parameters
+        ----------
+        params_1 : dict
+            Dictionary of coilset degrees of freedom, eg ``CoilSet.params_dict`` if
+            self._coils_fixed is False, else is the equilibrium or surface degrees of
+            freedom
+        params_2 : dict
+            Dictionary of equilibrium or surface degrees of freedom,
+            eg ``Equilibrium.params_dict``
+            Only required if ``self._eq_fixed = False``.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc.
+            Defaults to self._constants.
+
+        Returns
+        -------
+        f : array of floats
+            Minimum/maximum distance from coil to surface for each coil in the coilset.
+
+        """
+        if constants is None:
+            constants = self.constants
+        if self._eq_fixed:
+            curve_params = params_1
+        elif self._curve_fixed:
+            eq_params = params_1
+        else:
+            eq_params = params_1
+            curve_params = params_2
+
+        # coil pts; shape(ncoils,coils_grid.num_nodes,3)
+        if self._curve_fixed:
+            curve_pts = constants["curve_coords"]
+        else:
+            data = constants["curve"].compute(
+                ["R", "phi", "Z"],
+                params=curve_params, grid=constants["curve_grid"]
+            )
+            curve_pts = jnp.c_[data["R"], data["Z"]]
+            curve_pts = constants["curve_grid"].meshgrid_reshape(curve_pts, "rtz")[0,0]
+
+        # plasma pts; shape(plasma_grid.num_nodes,3)
+        if self._eq_fixed:
+            plasma_pts = constants["plasma_coords"]
+        else:
+            data = compute_fun(
+                constants["eq"],
+                self._data_keys,
+                params=eq_params,
+                transforms=constants["eq_transforms"],
+                profiles=constants["eq_profiles"],
+            )
+            plasma_pts = jnp.c_[data["R"], data["Z"]]
+            plasma_pts = constants["eq_transforms"]["grid"].meshgrid_reshape(plasma_pts, "rtz")[0]
+
+
+
+        # dist btwn all pts; shape(ncoils,plasma_grid.num_nodes,coil_grid.num_nodes)
+        dist = safenorm(curve_pts[None, :, :] - plasma_pts[:, :, :], axis=-1)
+        if self._use_softmin:
+            # minimum over plasma points, then max over coil points
+            max = softmax(jnp.c_[softmin(dist, self._softmin_alpha, axis=0) - constants["max_dist_per_phi"], jnp.zeros(constants["max_dist_per_phi"].shape[0])], self._softmin_alpha, axis=1)
+        else:
+            max = jnp.max(jnp.c_[jnp.min(dist, axis=0) - constants["max_dist_per_phi"], jnp.zeros(constants["max_dist_per_phi"].shape[0])], axis=1)
+
+        return max
+
