@@ -1938,7 +1938,7 @@ class SurfaceQuadraticFlux(_Objective):
         bounds_default="``target=0``.",
     )
 
-    _static_attrs = _Objective._static_attrs + ["_bs_chunk_size", "_field_fixed"]
+    _static_attrs = _Objective._static_attrs + ["_bs_chunk_size", "_field_fixed", "_surf_fixed", "_normalize_B_mag", "_normalize_g_mag"]
 
     _scalar = False
     _linear = False
@@ -1959,6 +1959,9 @@ class SurfaceQuadraticFlux(_Objective):
         field_grid=None,
         name="Surface Quadratic Flux",
         field_fixed=False,
+        surf_fixed=False,
+        normalize_B_mag=False,
+        normalize_g_mag=False,
         jac_chunk_size=None,
         *,
         bs_chunk_size=None,
@@ -1966,16 +1969,23 @@ class SurfaceQuadraticFlux(_Objective):
     ):
         if target is None and bounds is None:
             target = 0
+        if not isinstance(field, list):
+            field = [field]
         self._eval_grid = eval_grid
         self._surface = surface
         self._field = field
         self._field_grid = field_grid
         self._field_fixed = field_fixed
+        self._surf_fixed = surf_fixed
+        self._normalize_B_mag = normalize_B_mag
+        self._normalize_g_mag = normalize_g_mag
         self._bs_chunk_size = bs_chunk_size
 
-        things = [surface]
+        things = []
+        if not surf_fixed:
+            things += [surface]
         if not field_fixed:
-            things += [field]
+            things += field
         super().__init__(
             things=things,
             target=target,
@@ -2051,19 +2061,16 @@ class SurfaceQuadraticFlux(_Objective):
             scales = compute_scaling_factors(surface)
             Bscale = 1.0  # surface has no inherent B scale
             self._normalization = Bscale * scales["R0"] * scales["a"]
+            if self._normalize_g_mag: self._normalization = self._normalization / jnp.sqrt(eval_data["|e_theta x e_zeta|"]).sum()
 
         super().build(use_jit=use_jit, verbose=verbose)
 
-    def compute(self, params_1, params_2=None, constants=None):
+    def compute(self, *params, constants=None):
         """Compute normal field on surface.
 
         Parameters
         ----------
-        params_1 : dict
-            Dictionary of the surface's degrees of freedom.
-        params_2 : dict
-            Dictionary of the external field's degrees of freedom, only provided if
-            if field_fixed=False.
+        params : list
         constants : dict
             Dictionary of constant data, eg transforms, profiles etc. Defaults to
             self.constants
@@ -2074,30 +2081,49 @@ class SurfaceQuadraticFlux(_Objective):
             Bnorm on the QFM surface from the external field
 
         """
+
         if constants is None:
             constants = self.constants
-        field_params = params_2 if not self._field_fixed else None
-        surf_params = params_1
+        surf_params = params[0] if not self._surf_fixed else None
+        field_params = None
 
-        eval_data = compute_fun(
-            self._surface,
-            self._data_keys,
-            surf_params,
-            constants["eval_transforms"],
-            constants["eval_profiles"],
-        )
+        if not self._field_fixed and not self._surf_fixed:
+            field_params = params[1:]
+        elif not self._field_fixed:
+            field_params = params
+        else:
+            field_params = None
+
+        if not self._surf_fixed:
+            eval_data = compute_fun(
+                self._surface,
+                self._data_keys,
+                surf_params,
+                constants["eval_transforms"],
+                constants["eval_profiles"],
+            )
+        else:
+            eval_data = constants["eval_data"]
         x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
         if field_params is None:
-            field_params = constants["field"].params_dict
-        B_ext = constants["field"].compute_magnetic_field(
-            x,
-            source_grid=constants["field_grid"],
-            basis="rpz",
-            params=field_params,
-            chunk_size=self._bs_chunk_size,
-        )
+            field_params = [f.params_dict for f in constants["field"]]
+        B_ext = None
+        for g, f, p in zip(constants["field_grid"], constants["field"], field_params):
+            _B_ext = f.compute_magnetic_field(
+                x,
+                source_grid=g,
+                basis="rpz",
+                params=p,
+                chunk_size=self._bs_chunk_size,
+            )
+            if B_ext is None: B_ext = _B_ext
+            else: B_ext = B_ext + _B_ext
         B_ext = jnp.sum(B_ext * eval_data["n_rho"], axis=-1)
+        if self._normalize_B_mag:
+            B_ext = safediv(B_ext, safenorm(B_ext, axis=-1))
         f = B_ext * jnp.sqrt(eval_data["|e_theta x e_zeta|"])
+        if self._normalize_g_mag:
+            f = f / jnp.sqrt(eval_data["|e_theta x e_zeta|"]).sum()
         return f
 
 

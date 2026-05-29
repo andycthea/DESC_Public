@@ -1642,6 +1642,10 @@ class SurfacePoloidalCircumference(_Objective):
         target_default="``target=0``.", bounds_default="``target=0``.", coil=True
     )
 
+    _static_attrs = _Objective._static_attrs + [
+        "_normalized_to_initial",
+    ]
+
     _scalar = False  # Not always a scalar, if a coilset is passed in
     _units = "(m^2)"
     _print_value_fmt = "Surface Poloidal Circumference: "
@@ -1696,7 +1700,7 @@ class SurfacePoloidalCircumference(_Objective):
         self._data_keys = ["R_t", "Z_t"]
 
         data = self.things[0].compute(self._data_keys, grid=self._grid)
-        lengths = self._grid.meshgrid_reshape(np.linalg.norm(np.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
+        lengths = self._grid.meshgrid_reshape(jnp.linalg.norm(np.c_[data["R_t"], data["Z_t"]], axis=-1), "rtz")[0].sum(axis=0) / (self._grid.M*2+1) * jnp.pi * 2
         if self._normalize:
             if self._normalized_to_initial: self._normalization = 1.0
             else: self._normalization = lengths.mean()
@@ -1706,6 +1710,7 @@ class SurfacePoloidalCircumference(_Objective):
             "transforms": get_transforms(self._data_keys, obj=self.things[0], grid=self._grid),
             "profiles": get_profiles(self._data_keys, obj=self.things[0], grid=self._grid),
             "lengths": lengths,
+            "quad_weights": 1.0,
         }
 
         super().build(use_jit=use_jit, verbose=verbose)
