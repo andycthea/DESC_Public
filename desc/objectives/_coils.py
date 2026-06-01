@@ -2118,9 +2118,10 @@ class SurfaceQuadraticFlux(_Objective):
             )
             if B_ext is None: B_ext = _B_ext
             else: B_ext = B_ext + _B_ext
+        B_mag = safenorm(B_ext, axis=-1)
         B_ext = jnp.sum(B_ext * eval_data["n_rho"], axis=-1)
         if self._normalize_B_mag:
-            B_ext = safediv(B_ext, safenorm(B_ext, axis=-1))
+            B_ext = safediv(B_ext, B_mag)
         f = B_ext * jnp.sqrt(eval_data["|e_theta x e_zeta|"])
         if self._normalize_g_mag:
             f = f / jnp.sqrt(eval_data["|e_theta x e_zeta|"]).sum()
