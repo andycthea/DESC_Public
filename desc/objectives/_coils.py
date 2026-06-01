@@ -1938,7 +1938,7 @@ class SurfaceQuadraticFlux(_Objective):
         bounds_default="``target=0``.",
     )
 
-    _static_attrs = _Objective._static_attrs + ["_bs_chunk_size", "_field_fixed", "_surf_fixed", "_normalize_B_mag", "_normalize_g_mag"]
+    _static_attrs = _Objective._static_attrs + ["_bs_chunk_size", "_field_fixed", "_surf_fixed", "_normalize_B_mag", "_normalize_g_mag", "_exclude_g"]
 
     _scalar = False
     _linear = False
@@ -1962,6 +1962,7 @@ class SurfaceQuadraticFlux(_Objective):
         surf_fixed=False,
         normalize_B_mag=False,
         normalize_g_mag=False,
+        exclude_g=False,
         jac_chunk_size=None,
         *,
         bs_chunk_size=None,
@@ -1979,6 +1980,7 @@ class SurfaceQuadraticFlux(_Objective):
         self._surf_fixed = surf_fixed
         self._normalize_B_mag = normalize_B_mag
         self._normalize_g_mag = normalize_g_mag
+        self._exclude_g = exclude_g
         self._bs_chunk_size = bs_chunk_size
 
         things = []
@@ -2122,7 +2124,8 @@ class SurfaceQuadraticFlux(_Objective):
         B_ext = jnp.sum(B_ext * eval_data["n_rho"], axis=-1)
         if self._normalize_B_mag:
             B_ext = safediv(B_ext, B_mag)
-        f = B_ext * jnp.sqrt(eval_data["|e_theta x e_zeta|"])
+        if not self._exclude_g: f = B_ext * jnp.sqrt(eval_data["|e_theta x e_zeta|"])
+        else: f = B_ext
         if self._normalize_g_mag:
             f = f / jnp.sqrt(eval_data["|e_theta x e_zeta|"]).sum()
         return f
