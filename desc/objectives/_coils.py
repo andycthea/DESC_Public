@@ -1031,8 +1031,9 @@ class CoilSetToCoilSetMinDistance(_Objective):
 
     Parameters
     ----------
-    coil : CoilSet
-        Coil(s) that are to be optimized.
+    coil : Coil or CoilSet
+        Coil(s) that are to be optimized. May be a single ``Coil`` or a ``CoilSet``;
+        one value is returned per coil (so a single ``Coil`` yields one value).
     fixed_coil : CoilSet
         Static reference coil(s) that are not optimized (e.g. the existing TF coils).
         The signed distance from each coil in ``coil`` to the coils in ``fixed_coil``
@@ -1093,7 +1094,7 @@ class CoilSetToCoilSetMinDistance(_Objective):
         softmin_alpha=1.0,
         dist_chunk_size=None,
     ):
-        from desc.coils import CoilSet
+        from desc.coils import CoilSet, _Coil
 
         if target is None and bounds is None:
             bounds = (1, np.inf)
@@ -1104,9 +1105,9 @@ class CoilSetToCoilSetMinDistance(_Objective):
         self._softmin_alpha = softmin_alpha
         self._dist_chunk_size = dist_chunk_size
         errorif(
-            not isinstance(coil, CoilSet),
+            not isinstance(coil, _Coil),
             ValueError,
-            "coil must be of type CoilSet, not an individual Coil",
+            "coil must be a Coil or CoilSet",
         )
         errorif(
             not isinstance(fixed_coil, CoilSet),
