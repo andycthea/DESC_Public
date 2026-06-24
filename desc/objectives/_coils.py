@@ -1003,6 +1003,249 @@ class CoilSetMinDistance(_Objective):
         return min_dist_per_coil
 
 
+class CoilSetToCoilSetMinDistance(_Objective):
+    """Target the signed minimum distance between two coilsets, one of which is static.
+
+    Will yield one value per coil in the optimized coilset, which is the minimum
+    *signed* distance from that coil to any coil in the static (fixed) coilset. The
+    distances between coils within the optimized coilset, and within the fixed coilset,
+    are not considered.
+
+    This is intended for adding a new coil (or set of coils) to an existing machine and
+    optimizing its placement while ensuring it does not collide with, or thread through,
+    the existing coils, which should not move. A typical use case is a coil that runs
+    toroidally sitting above a set of TF coils that run poloidally (as in a tokamak),
+    where the new coil must stay outside the volume linked by the TF coils.
+
+    The sign of the distance encodes whether the optimized coil is inside or outside the
+    region enclosed by the (fixed) TF coils. For each optimized point, and the nearest
+    fixed coil, two vectors are formed from the center (centroid) of that fixed coil:
+    one to the optimized point, and one to the closest point on the fixed coil. The
+    optimized point lies inside the area enclosed by the fixed coil when it is closer to
+    the center than the coil's edge, i.e. when the center-to-point vector is shorter than
+    the center-to-closest-point vector; otherwise it lies outside. The returned distance
+    is signed accordingly, so positive values indicate clearance outside the linked
+    interior and negative values indicate penetration into it. Using
+    ``bounds=(gap, np.inf)`` keeps every optimized coil at least ``gap`` outside the
+    fixed coils.
+
+    Parameters
+    ----------
+    coil : CoilSet
+        Coil(s) that are to be optimized.
+    fixed_coil : CoilSet
+        Static reference coil(s) that are not optimized (e.g. the existing TF coils).
+        The signed distance from each coil in ``coil`` to the coils in ``fixed_coil``
+        is enforced.
+    grid : Grid, list, optional
+        Collocation grid used to discretize each coil in ``coil``. Defaults to the
+        default grid for the given coil-type, see ``coils.py`` and ``curve.py`` for
+        more details. If a list, must have the same structure as ``coil``.
+    fixed_grid : Grid, list, optional
+        Collocation grid used to discretize each coil in ``fixed_coil``. Defaults to
+        the default grid for the given coil-type. If a list, must have the same
+        structure as ``fixed_coil``.
+    use_softmin: bool, optional
+        Use softmin or hard min. Softmin is a smooth approximation to the actual minimum
+        distance that may give smoother gradients, at the expense of being slightly more
+        expensive and only an approximate minimum.
+    softmin_alpha: float, optional
+        Parameter used for softmin. The larger ``softmin_alpha``, the closer the
+        softmin approximates the hardmin. softmin -> hardmin as
+        ``softmin_alpha`` -> infinity.
+    dist_chunk_size : int > 0, optional
+        When computing distances, how many coils to consider at once. Default is all
+        coils, which is generally the fastest but requires the most memory. If there are
+        a large number of coils, or if the resolution is very high, setting this to a
+        small value will reduce peak memory usage at the cost of slightly increased
+        runtime.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``bounds=(1,np.inf)``.",
+        bounds_default="``bounds=(1,np.inf)``.",
+        coil=True,
+    )
+
+    _static_attrs = _Objective._static_attrs + ["_dist_chunk_size", "_use_softmin"]
+
+    _scalar = False
+    _units = "(m)"
+    _print_value_fmt = "Signed minimum coil-coil distance to fixed coilset: "
+
+    def __init__(
+        self,
+        coil,
+        fixed_coil,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        fixed_grid=None,
+        name="coil-coil minimum distance to fixed coilset",
+        jac_chunk_size=None,
+        use_softmin=False,
+        softmin_alpha=1.0,
+        dist_chunk_size=None,
+    ):
+        from desc.coils import CoilSet
+
+        if target is None and bounds is None:
+            bounds = (1, np.inf)
+        self._grid = grid
+        self._fixed_grid = fixed_grid
+        self._fixed_coil = fixed_coil
+        self._use_softmin = use_softmin
+        self._softmin_alpha = softmin_alpha
+        self._dist_chunk_size = dist_chunk_size
+        errorif(
+            not isinstance(coil, CoilSet),
+            ValueError,
+            "coil must be of type CoilSet, not an individual Coil",
+        )
+        errorif(
+            not isinstance(fixed_coil, CoilSet),
+            ValueError,
+            "fixed_coil must be of type CoilSet, not an individual Coil",
+        )
+        super().__init__(
+            things=coil,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        coilset = self.things[0]
+        fixed_coilset = self._fixed_coil
+        grid = self._grid or None
+        fixed_grid = self._fixed_grid or None
+
+        self._dim_f = coilset.num_coils
+
+        # the fixed coilset does not move, so precompute its positions once.
+        # shape (num_fixed_coils, fixed_grid.num_nodes, 3)
+        fixed_pts = fixed_coilset._compute_position(
+            params=fixed_coilset.params_dict, grid=fixed_grid, basis="xyz"
+        )
+        # center of each fixed coil, taken as the centroid of its discretized
+        # points; shape (num_fixed_coils, 3)
+        fixed_centers = jnp.mean(fixed_pts, axis=1)
+
+        self._constants = {
+            "coilset": coilset,
+            "grid": grid,
+            "fixed_pts": fixed_pts,
+            "fixed_centers": fixed_centers,
+            "quad_weights": 1.0,
+        }
+
+        if self._normalize:
+            coils = tree_leaves(coilset, is_leaf=lambda x: not hasattr(x, "__len__"))
+            scales = [compute_scaling_factors(coil)["a"] for coil in coils]
+            self._normalization = np.mean(scales)  # mean length of coils
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute signed minimum distances between the coilset and the fixed coilset.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of coilset degrees of freedom, eg CoilSet.params_dict
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc.
+            Defaults to self._constants.
+
+        Returns
+        -------
+        f : array of floats
+            Signed minimum distance to a coil in the fixed coilset for each coil in the
+            optimized coilset. Positive values indicate the coil is outside the volume
+            enclosed by the (nearest) fixed coil, negative values indicate it has
+            entered that volume.
+
+        """
+        if constants is None:
+            constants = self.constants
+        # pts shape (num_coils, num_nodes, 3)
+        pts = constants["coilset"]._compute_position(
+            params=params, grid=constants["grid"], basis="xyz"
+        )
+        # fixed_pts shape (num_fixed_coils, num_fixed_nodes, 3)
+        fixed_pts = constants["fixed_pts"]
+        # fixed_centers shape (num_fixed_coils, 3)
+        fixed_centers = constants["fixed_centers"]
+
+        def body(k):
+            # points on the kth optimized coil; shape (num_nodes, 3)
+            coil_pts = pts[k]
+            # distance from every optimized point to every fixed point;
+            # shape (num_fixed_coils, num_nodes, num_fixed_nodes)
+            dist = safenorm(
+                coil_pts[None, :, None, :] - fixed_pts[:, None, :, :], axis=-1
+            )
+            # for each (fixed coil, optimized point), the closest point on that coil
+            closest_idx = jnp.argmin(dist, axis=-1)  # (num_fixed_coils, num_nodes)
+            min_dist = jnp.min(dist, axis=-1)  # (num_fixed_coils, num_nodes)
+            # gather the closest point on each fixed coil;
+            # shape (num_fixed_coils, num_nodes, 3)
+            closest_pts = jnp.take_along_axis(
+                fixed_pts,
+                jnp.broadcast_to(closest_idx[..., None], closest_idx.shape + (3,)),
+                axis=1,
+            )
+
+            # vector from each fixed coil center to the optimized points, and from
+            # each fixed coil center to the closest point on that coil
+            to_point = coil_pts[None, :, :] - fixed_centers[:, None, :]
+            to_closest = closest_pts - fixed_centers[:, None, :]
+            # an optimized point is inside the area enclosed by a fixed coil when it is
+            # closer to the coil's center than the coil's edge (closest point) is.
+            # radial < 0 => inside, radial > 0 => outside.
+            radial = safenorm(to_point, axis=-1) - safenorm(to_closest, axis=-1)
+
+            # for each optimized point, use the sign from the *nearest* fixed coil,
+            # which is the one bounding the linked interior at that point.
+            nearest = jnp.argmin(min_dist, axis=0)  # (num_nodes,)
+            d = jnp.min(min_dist, axis=0)  # (num_nodes,)
+            radial_nearest = jnp.take_along_axis(radial, nearest[None, :], axis=0)[0]
+            sign = jnp.where(radial_nearest < 0, -1.0, 1.0)  # (num_nodes,)
+            signed_dist = sign * d  # (num_nodes,)
+
+            # worst-case (smallest) signed clearance over the coil; negative values
+            # indicate the coil has entered the linked interior.
+            if self._use_softmin:
+                return softmin(signed_dist, self._softmin_alpha)
+            return jnp.min(signed_dist)
+
+        k = jnp.arange(self.dim_f)
+        min_dist_per_coil = vmap_chunked(body, chunk_size=self._dist_chunk_size)(k)
+        return min_dist_per_coil
+
+
 class PlasmaCoilSetDistanceBound(_Objective):
     """Target the distance between the plasma and coilset.
 
@@ -1633,7 +1876,8 @@ class CoilChargeTime(_Objective):
         self._indices = tree_leaves(broadcast_tree(current_params, all_params))
 
         if self._normalize:
-            self._normalization = np.mean([self._constants["initial_current"] ** 2])
+            if self._softmax_alpha is not None: self._normalization = np.max(np.abs(self._constants["initial_current"]))
+            else: self._normalization = np.mean(np.abs(self._constants["initial_current"]))
 
         super().build(use_jit=use_jit, verbose=verbose)
 
@@ -1656,7 +1900,7 @@ class CoilChargeTime(_Objective):
         if constants is None:
             constants = self.constants
         coil_currents = jnp.array([p["current"] for p in params]).flatten()
-        charge_time = jnp.maximum(jnp.abs(coil_currents), jnp.abs(constants["initial_current"])) * (coil_currents - constants["initial_current"])
+        charge_time = (coil_currents - constants["initial_current"])
         if self._softmax_alpha is not None: charge_time = softmax(jnp.abs(charge_time), self._softmax_alpha)
         return charge_time
 
@@ -2198,6 +2442,7 @@ class Bxdl(_Objective):
         "_field_fixed",
         "_curve_fixed",
         "_eq_fixed",
+        "_normalize_B_mag"
     ]
 
     def __init__(
@@ -2221,6 +2466,7 @@ class Bxdl(_Objective):
         field_fixed=False,
         curve_fixed=True,
         eq_fixed=True,
+        normalize_B_mag=True,
         **kwargs,
     ):
 
@@ -2239,6 +2485,7 @@ class Bxdl(_Objective):
         self._field_fixed = field_fixed
         self._curve_fixed = curve_fixed
         self._eq_fixed = eq_fixed
+        self._normalize_B_mag = normalize_B_mag
 
         if not field_fixed:
             things += self._field
@@ -2339,11 +2586,13 @@ class Bxdl(_Objective):
         if verbose > 1:
             timer.disp("Precomputing transforms")
 
-        if self._normalize and self._eq is not None:
-            scales = compute_scaling_factors(eq)
-            self._normalization = scales["B"]  # assume field of same scale as eq
-        elif self._normalize and self._eq is None:
-            self._normalization = 1
+        # if self._normalize and self._eq is not None:
+        #     scales = compute_scaling_factors(eq)
+        #     self._normalization = scales["B"]  # assume field of same scale as eq
+        # elif self._normalize and self._eq is None:
+        #     self._normalization = 1
+
+        self._normalization = 1
 
         super().build(use_jit=use_jit, verbose=verbose)
 
@@ -2415,7 +2664,9 @@ class Bxdl(_Objective):
                 **self._eq_kwargs,
             )
             B_ext = B_ext + B_plasma
+        B_ext_norm = safenorm(B_ext, axis=-1)
         f = safenorm(cross(B_ext, eval_data["frenet_tangent"], axis=-1), axis=-1)
+        if self._normalize_B_mag: f = safediv(f, B_ext_norm)
         return f
 
 
@@ -3103,6 +3354,174 @@ class FieldNormalError(_Objective):
             )
 
         return jnp.sum(B_total * normals, axis=-1)
+    
+
+class CurveToCurveDist(_Objective):
+    """Target the distance between two curves at each toroidal slice.
+
+    Both curves are parameterized by the toroidal angle, so each node of the
+    collocation grid defines a toroidal slice at which each curve has a single
+    point. This objective returns the Euclidean distance between those two points
+    at every node in the grid (i.e. one distance value per toroidal slice).
+
+    Parameters
+    ----------
+    curve_1 : FourierRZCurve
+        First curve.
+    curve_2 : FourierRZCurve
+        Second curve. Must be evaluated on the same toroidal slices as ``curve_1``.
+    grid : Grid or int, optional
+        Collocation grid containing the toroidal nodes to evaluate the curves at.
+        If an integer, uses ``LinearGrid(N=grid)``. Defaults to
+        ``LinearGrid(N=2 * max(curve_1.N, curve_2.N) + 5)``.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``bounds=(0, np.inf)``.",
+        bounds_default="``bounds=(0, np.inf)``.",
+    )
+
+    _scalar = False
+    _units = "(m)"
+    _print_value_fmt = "Curve-curve distance: "
+
+    def __init__(
+        self,
+        curve_1,
+        curve_2,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="curve-curve distance",
+        jac_chunk_size=None,
+    ):
+        if target is None and bounds is None:
+            bounds = (0, np.inf)
+        self._curve_1 = curve_1
+        self._curve_2 = curve_2
+        self._grid = grid
+        super().__init__(
+            things=[curve_1, curve_2],
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        curve_1 = self.things[0]
+        curve_2 = self.things[1]
+
+        grid = self._grid
+        if grid is None:
+            grid = LinearGrid(N=2 * max(curve_1.N, curve_2.N) + 5)
+        if isinstance(grid, numbers.Integral):
+            grid = LinearGrid(N=grid)
+        errorif(
+            not isinstance(grid, _Grid),
+            TypeError,
+            f"grid must be a Grid object or an integer, got type {type(grid)}",
+        )
+        errorif(
+            grid.num_rho > 1 or grid.num_theta > 1,
+            ValueError,
+            "Only use toroidal resolution for curve grids.",
+        )
+        self._grid = grid
+
+        self._data_keys = ["x"]
+        self._dim_f = grid.num_nodes
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+
+        transforms_1 = get_transforms(self._data_keys, obj=curve_1, grid=grid)
+        transforms_2 = get_transforms(self._data_keys, obj=curve_2, grid=grid)
+
+        self._constants = {
+            "transforms_1": transforms_1,
+            "transforms_2": transforms_2,
+            "quad_weights": 1.0,
+        }
+
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        if self._normalize:
+            scale_1 = compute_scaling_factors(curve_1)["a"]
+            scale_2 = compute_scaling_factors(curve_2)["a"]
+            self._normalization = np.mean([scale_1, scale_2])
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params_1, params_2, constants=None):
+        """Compute distance between the two curves at each toroidal slice.
+
+        Parameters
+        ----------
+        params_1 : dict
+            Dictionary of curve_1's degrees of freedom.
+        params_2 : dict
+            Dictionary of curve_2's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants.
+
+        Returns
+        -------
+        f : array of floats
+            Distance between the two curves at each node in the grid.
+
+        """
+        if constants is None:
+            constants = self.constants
+
+        data_1 = self._curve_1.compute(
+            self._data_keys,
+            params=params_1,
+            transforms=constants["transforms_1"],
+            grid=self._grid,
+        )
+        data_2 = self._curve_2.compute(
+            self._data_keys,
+            params=params_2,
+            transforms=constants["transforms_2"],
+            grid=self._grid,
+        )
+
+        # curve positions are returned in rpz; convert to xyz for a correct
+        # Euclidean distance between points at the same toroidal slice
+        x_1 = rpz2xyz(data_1["x"])
+        x_2 = rpz2xyz(data_2["x"])
+
+        return safenorm(x_1 - x_2, axis=-1)
+
+
+
 
 
 class ToroidalFlux(_Objective):

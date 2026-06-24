@@ -10,6 +10,7 @@ from ._coils import (
     CoilLength,
     CoilSetLinkingNumber,
     CoilSetMinDistance,
+    CoilSetToCoilSetMinDistance,
     CoilTorsion,
     LinkingCurrentConsistency,
     PlasmaCoilSetDistanceBound,
@@ -21,6 +22,7 @@ from ._coils import (
     FieldNormalError,
     FieldOnCurve,
     CoilChargeTime,
+    CurveToCurveDist,
 )
 from ._equilibrium import (
     CurrentDensity,
