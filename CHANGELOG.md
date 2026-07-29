@@ -1,10 +1,74 @@
 Changelog
 =========
 
+Performance Improvements
+
+- Speeds up the ``"qr"`` trust-region subproblem and Newton-step solves in the least-squares optimizers by reusing the Jacobian QR factorization across the Levenberg-Marquardt parameter sweep. On ``jax >= 0.10.0`` this uses ``qr_multiply`` to additionally avoid forming ``Q`` explicitly; on older versions a fallback preserves the same results.
+- Adds ``surf_batch_size`` kwarg to Boozer and omnigenous field compute variables, to allow for tuning of the memory usage when computing these quantities by choosing how many surfaces to simultaneously compute.
+  - Also adds ``surf_batch_size`` as an additional kwarg to ``make_boozmn_output``, as well as the objectives ``Omnigenity`` and ``QuasisymmetryBoozer``
+
+Bug Fixes
+
+- Fixes bug that was always setting NFP=1 in ``to_FourierRZ`` methods.
+- Fixes a bug in `_CoilObjective` for objectives which are computed per-grid node when at least one entry of `weight` is zero.
+- Fixes ``VMECIO.save`` metadata for current-density variables and corrects the
+  asymmetric ``currvmns`` magnetic-axis extrapolation.
+- Bug (#2120) in ``desc.magnetic_fields.OmnigenousField`` computing NaNs when the ``B_lm`` corresponded to flat magnetic wells fixed by ``interpax`` ``v0.3.14``, updated tests to exercise this.
+- Fixes bug in ``reactor_QA.py`` script where the current profile was allowed to have a nonzero rho^1 component, which resulted in an unphysical profile near-axis.
+    - Updates ``"reactor_QA"`` in ``desc.examples`` to fix this. Note that if using ``"reactor_QA"`` example from ``v0.16.0`` until this fix, the current profile in that example has this issue.
+
+Breaking Changes
+
+- Name change in `_CoilObjective` replacing `coilset_mask` with `objective_mask`. Custom subclasses with `_broadcast_input="node"` that previously used `coilset_mask` should switch to `objective_mask`.
+
+v0.17.2
+-------
+
+New Features
+
+- Adds ``desc.objectives.DeflationOperator``, a new objective class which can be used to apply deflation techniques to equilibrium and optimization problems to find multiple local minima or multiple solutions from a single initial point, either by wrapping an existing ``desc.objectives._Objective`` object or by including as an additional penalty or constraint. Also adds a tutorial showing this functionality.
+- Sub-objectives of an `ObjectiveFunction` can now have different `use_jit` values than the `ObjectiveFunction`. These objectives have to be built before building the `ObjectiveFunction`.
+- Adds ``num_neighbors`` parameter to ``CoilSetMinDistance`` that limits the pairwise distance computation to the nearest neighbors per coil, reducing memory useage for large coilsets.
+- Method to plot frequency spectrum of inverse stream map in field line coordinates ``Bounce2D.plot_angle_spectrum``.
+- Method to compute bounce integrals in batches is now added to the public API ``Bounce2D.batch``.
+- Initiated deprecation of ``Bounce2D.compute_fieldline_length`` in favor of ``eq.compute("V_psi")``.
+- The quadrature resolution in ``Bounce2D.compute_fieldline_length`` now corresponds to the resolution over a single field period instead of the resolution over a toroidal transit.
+- Adds an optional attribute `ion_density` to the `Equilibrium` class, to allow the ion density profile to be set independently of the electron density and effective atomic number. Also adds compute functions for ``"ni_rr"`` and ``"Zeff_rr"``.
+- Modernizes dependencies to use [``nvidia-ml-py``](https://pypi.org/project/nvidia-ml-py/) in place of [``nvgpu``](https://github.com/rossumai/nvgpu).
+  If you are updating an existing software environment uninstall ``pynvml`` first and then reinstall the dependencies to correctly get ``nvidia-ml-py``.
+
+Bug Fixes
+
+- Fixes SyntaxError thrown when loading hdf5 data from file-like objects.
+- Fixes a bug in `OmnigenousField.change_resolution` when changing `L_B`.
+- Scaling a `ScaledProfile` or taking power of a `PowerProfile` now only updates the `scale`/`power` attributes instead of nesting the `ScaledProfile`/`PowerProfile`s.
+- `jax.Array`s in `_static_attrs` will be automatically converted to `np.ndarray` to prevent stalling code. In general, jax arrays should be omitted in `_static_attrs`.
+- Fixes a bug in `desc.magnetic_fields.field_integrate` when calling with an integer `bs_chunk_size`.
+
+Performance Improvements
+
+- Reduces import time of `desc` modules.
+    - Now, `desc.compute._build_data_index` uses depth-first search algorithm to construct the dependency tree.
+    - Some of the default value computations at import time are removed (i.e. `desc.integrals.bounce_integral.default_quad`)
+- [Significantly improves convergence of inverse stream maps](https://github.com/PlasmaControl/DESC/pull/1919).
+- Check-pointing to bounce integrals to improve speed and reduce memory of reverse mode differentiation.
+- Resolves a JAX memory regression in bounce integrals by avoiding materialization of a large tensor in memory. Previously, we had closed the issue by adding nuffts as a workaround. This update actually solves the issue for the case when a user specifies to not use nuffts as well.
+- ``ObjectiveFunction.print_value`` can now use the previously computed ``compute_scaled_error`` values to print. For bounded objectives, we fall back to computing ``compute_unscaled``. Additionally, ``compute_scaled_error`` and array splitting are used in other parts of the code to prevent recompilation for one-time tasks, which makes initialization faster.
+
+Deprecations
+
+- `constants` argument of `compute`, `jvp`, `jac`, `grad` and `hess` methods (including all of their variants) to all objective classes (including `ObjectiveFunction` and wrappers) is deprecated and will be removed in a future release. This argument was not necessary, and the code will still work if user doesn't pass it. Users should update their custom objectives for this change. In addition, `constants` property of the `ObjectiveFunction` and all sub-classes of `_Objective` is deprecated.
+
+
+v0.17.1
+-------
+
 Bug Fixes
 
 - Fixes incorrect units in the documentation of some curvature variables.
 - Fixes SyntaxError thrown when loading hdf5 data from file-like objects.
+
+
 
 v0.17.0
 -------
@@ -34,6 +98,9 @@ or if multiple things are being optimized, `x_scale` can be a list of dict, one 
 - Changes the import paths for ``desc.external`` to require reference to the sub-modules.
 - Adds a differentiable utility for finding constant offset toroidal surfaces inside of optimizations. See [PR](https://github.com/PlasmaControl/DESC/pull/2016) for more details.
 - Add support for Python 3.14
+- Adds support for optimization targeting individual coils in a coilset.
+    - Coil objectives accept pytree inputs for `target`, `bounds`, and `weight`.
+    - Able to set weights to zero, excluding certain coils from the objective.
 
 Bug Fixes
 
@@ -69,9 +136,6 @@ New Features
     - `field_line_integrate` function doesn't accept additional keyword-arguments related to `diffrax`, if it is necessary, they must be given through `options` dictionary.
     - ``poincare_plot`` and ``plot_field_lines`` functions can now plot partial results if the integration failed. Previously, user had to pass ``throw=False`` or change the integration parameters. Users can ignore the warnings that are caused by hitting the bounds (i.e. `Terminating differential equation solve because an event occurred.`).
     - `chunk_size` argument is now used for chunking the number of field lines. For the chunking of Biot-Savart integration for the magnetic field, users can use `bs_chunk_size` instead.
-- Adds support for optimization targeting individual coils in a coilset.
-  - Coil objectives accept pytree inputs for `target`, `bounds`, and `weight`.
-  - Able to set weights to zero, excluding certain coils from the objective.
 
 
 

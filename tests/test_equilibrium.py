@@ -13,7 +13,7 @@ from desc.backend import sign
 from desc.compute.utils import get_transforms
 from desc.continuation import solve_continuation_automatic
 from desc.equilibrium import EquilibriaFamily, Equilibrium
-from desc.equilibrium.coords import _map_clebsch_coordinates
+from desc.equilibrium.coords import _map_poloidal_coordinates
 from desc.examples import get
 from desc.geometry import FourierRZToroidalSurface
 from desc.grid import Grid, LinearGrid
@@ -111,7 +111,7 @@ def test_map_clebsch_coordinates():
         lmbda.grid.meshgrid_reshape(lmbda.grid.nodes[:, 2], "rtz")[0, 0, ::-1], zeta
     )
     np.testing.assert_allclose(
-        _map_clebsch_coordinates(iota, alpha, zeta[::-1], eq.L_lmn, lmbda)[..., ::-1],
+        _map_poloidal_coordinates(iota, alpha, zeta[::-1], eq.L_lmn, lmbda)[..., ::-1],
         grid.meshgrid_reshape(out[:, 1], "raz"),
     )
 
