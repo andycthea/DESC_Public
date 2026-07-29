@@ -207,6 +207,7 @@ Objective Functions
     desc.objectives.CoilLength
     desc.objectives.CoilSetLinkingNumber
     desc.objectives.CoilSetMinDistance
+    desc.objectives.CoilSetToCoilSetMinDistance
     desc.objectives.CoilTorsion
     desc.objectives.CurrentDensity
     desc.objectives.EffectiveRipple

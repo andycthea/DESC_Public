@@ -18,6 +18,8 @@ from desc.utils import (
     parse_argname_change,
     setdefault,
     warnif,
+    safediv,
+    safenorm,
 )
 
 from ..integrals.singularities import best_params, best_ratio
@@ -800,6 +802,7 @@ class BoundaryError(_Objective):
         field_grid=None,
         field_fixed=False,
         name="Boundary error",
+        normalize_Bn=False,
         jac_chunk_size=None,
         *,
         bs_chunk_size=None,
@@ -816,6 +819,7 @@ class BoundaryError(_Objective):
         self._field_grid = field_grid
         self._bs_chunk_size = bs_chunk_size
         self._include_Bvac_div_2 = include_Bvac_div_2
+        self._normalize_Bn = normalize_Bn
         B_plasma_chunk_size = parse_argname_change(
             B_plasma_chunk_size, kwargs, "loop", "B_plasma_chunk_size"
         )
@@ -1167,6 +1171,7 @@ class BoundaryError(_Objective):
 
         g = eval_data["|e_theta x e_zeta|"]
         Bn_err = Bn * g
+        if self._normalize_Bn: Bn_err = safediv(Bn_err, safenorm(Bex_total, axis=-1))
         Bsq_err = jnp.where(
             eval_data["p"] == 0,
             (bsq_in - bsq_out) * g,

@@ -1852,7 +1852,7 @@ class CurveToCurveDistance(_Objective):
             params=params,
             transforms=constants["transforms"],
         )
-        return jnp.linalg.norm(jnp.c_[data["R"], data["Z"]] - jnp.c_[constants["R_fixed"], constants["Z_fixed"]], axis=-1)
+        return safenorm(jnp.c_[data["R"], data["Z"]] - jnp.c_[constants["R_fixed"], constants["Z_fixed"]], axis=-1)
 
 
 class EquilibriumToCurveDistanceBound(_Objective):

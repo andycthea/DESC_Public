@@ -52,6 +52,48 @@ def _1(params, transforms, profiles, data, **kwargs):
     data["1"] = jnp.ones(transforms["grid"].num_nodes)
     return data
 
+@register_compute_fun(
+    name="R_lmn",
+    label="R_lmn",
+    units="~",
+    units_long="not applicable",
+    description="Modes for R",
+    dim=0,
+    params=["R_lmn"],
+    transforms={},
+    profiles=[],
+    coordinates="",
+    data=[],
+    parameterization=[
+        "desc.equilibrium.equilibrium.Equilibrium",
+        "desc.geometry.core.Surface",
+    ],
+)
+def _R_lmn(params, transforms, profiles, data, **kwargs):
+    data["R_lmn"] = params["R_lmn"]
+    return data
+
+@register_compute_fun(
+    name="Z_lmn",
+    label="Z_lmn",
+    units="~",
+    units_long="not applicable",
+    description="Modes for Z",
+    dim=0,
+    params=["Z_lmn"],
+    transforms={},
+    profiles=[],
+    coordinates="",
+    data=[],
+    parameterization=[
+        "desc.equilibrium.equilibrium.Equilibrium",
+        "desc.geometry.core.Surface",
+    ],
+)
+def _Z_lmn(params, transforms, profiles, data, **kwargs):
+    data["Z_lmn"] = params["Z_lmn"]
+    return data
+
 
 @register_compute_fun(
     name="x",

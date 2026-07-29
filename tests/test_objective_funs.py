@@ -28,7 +28,7 @@ from desc.coils import (
 from desc.compute import get_transforms
 from desc.equilibrium import Equilibrium
 from desc.examples import get
-from desc.geometry import FourierPlanarCurve, FourierRZToroidalSurface, FourierXYZCurve
+from desc.geometry import FourierPlanarCurve, FourierRZToroidalSurface, FourierXYZCurve, FourierRZCurve
 from desc.grid import ConcentricGrid, Grid, LinearGrid, QuadratureGrid
 from desc.integrals import Bounce2D
 from desc.io import load
@@ -92,6 +92,7 @@ from desc.objectives import (
     ToroidalFlux,
     VacuumBoundaryError,
     Volume,
+    EquilibriumToCurveDistanceBound,
     get_NAE_constraints,
 )
 from desc.objectives._free_boundary import BoundaryErrorNESTOR
@@ -2197,6 +2198,29 @@ class TestObjectiveFunction:
         obj = BootstrapRedlConsistency(eq, grid=grid)
         with pytest.raises(ValueError, match="vanish"):
             obj.build()
+
+    @pytest.mark.unit
+    def test_equilibrium_to_curve_dist(self):
+        """Test calculation of min distance from curve to equilibrium."""
+        R0 = 10.0
+        a_p = 1.0
+        a_s = 2.0
+        # default eq has R0=10, a=1
+        eq = Equilibrium(M=3, N=2)
+        # surface with same R0, a=2, so true d=1 for all pts
+        curve = FourierRZCurve(
+            R_n=[R0, 0], Z_n=[0, -a_s], modes_R=[0, 1], modes_Z=[-1, 0], sym=False
+        )
+        # For equally spaced grids, should get true d=1
+        curv_grid = LinearGrid(N=6)
+        plas_grid = LinearGrid(M=24, N=6)
+        obj = EquilibriumToCurveDistanceBound(
+            eq=eq, curve=curve, max_dist_per_phi=np.ones(curv_grid.N*2+1), plasma_grid=plas_grid, curve_grid=curv_grid, use_softmin=True, softmin_alpha=10.0
+        )
+        obj.build()
+        d = obj.compute_unscaled(*obj.xs(eq, curve))
+        print(d)
+        # np.testing.assert_allclose(d, a_s - a_p)
 
 
 @pytest.mark.regression
