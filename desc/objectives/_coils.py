@@ -662,6 +662,225 @@ class CoilTorsion(_CoilObjective):
         return out[self._coilset_tree["objective_mask"]]
 
 
+class CoilR(_CoilObjective):
+    """Cylindrical radial coordinate R of the coils.
+
+    Targets the raw value of R = sqrt(X**2 + Y**2) at each grid node of each coil.
+    Unlike ``GenericObjective("R", coil)``, this works for a ``CoilSet`` or
+    ``MixedCoilSet`` as well as a single coil.
+
+    Useful for bounding how close a coil may come to the machine axis (R=0), e.g.
+    ``bounds=(R_min, np.inf)`` keeps every node of every optimized coil at least
+    ``R_min`` away from the axis, and ``bounds=(R_min, R_max)`` additionally keeps
+    them inside R_max.
+
+    Parameters
+    ----------
+    coil : CoilSet or Coil
+        Coil(s) that are to be optimized
+    grid : Grid, optional
+        Collocation grid containing the nodes to evaluate at.
+        Defaults to ``LinearGrid(N=2 * coil.N + 5)``
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``bounds=(0,np.inf)``.",
+        bounds_default="``bounds=(0,np.inf)``.",
+        coil=True,
+    )
+
+    _scalar = False
+    _units = "(m)"
+    _print_value_fmt = "Coil R: "
+    _broadcast_input = "node"
+
+    def __init__(
+        self,
+        coil,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="coil R",
+        jac_chunk_size=None,
+    ):
+        if target is None and bounds is None:
+            bounds = (0, np.inf)
+
+        super().__init__(
+            coil,
+            ["R"],
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            grid=grid,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        super().build(use_jit=use_jit, verbose=verbose)
+
+        # R is a pointwise geometric quantity, not an integral, so don't weight
+        # the residuals by the grid spacing
+        self._constants["quad_weights"] = 1
+
+        if self._normalize:
+            self._normalization = np.mean([scale["a"] for scale in self._scales])
+
+        _Objective.build(self, use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute coil R.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of the coil's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants. (Deprecated)
+
+        Returns
+        -------
+        f : array of floats
+            1D array of R values at each grid node of each coil.
+
+        """
+        data = super().compute(params, constants=constants)
+        data = tree_leaves(data, is_leaf=lambda x: isinstance(x, dict))
+        out = jnp.concatenate([dat["R"] for dat in data])
+        return out[self._coilset_tree["objective_mask"]]
+
+class CoilZ(_CoilObjective):
+    """Cylindrical vertical coordinate Z of the coils.
+
+    Targets the raw value of R = sqrt(X**2 + Y**2) at each grid node of each coil.
+    Unlike ``GenericObjective("Z", coil)``, this works for a ``CoilSet`` or
+    ``MixedCoilSet`` as well as a single coil.
+
+    Useful for bounding how close a coil may come to the machine axis (Z=0), e.g.
+    ``bounds=(Z_min, np.inf)`` keeps every node of every optimized coil at least
+    ``Z_min`` away from the axis, and ``bounds=(Z_min, Z_max)`` additionally keeps
+    them inside Z_max.
+
+    Parameters
+    ----------
+    coil : CoilSet or Coil
+        Coil(s) that are to be optimized
+    grid : Grid, optional
+        Collocation grid containing the nodes to evaluate at.
+        Defaults to ``LinearGrid(N=2 * coil.N + 5)``
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``bounds=(0,np.inf)``.",
+        bounds_default="``bounds=(0,np.inf)``.",
+        coil=True,
+    )
+
+    _scalar = False
+    _units = "(m)"
+    _print_value_fmt = "Coil Z: "
+    _broadcast_input = "node"
+
+    def __init__(
+        self,
+        coil,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="coil Z",
+        jac_chunk_size=None,
+    ):
+        if target is None and bounds is None:
+            bounds = (0, np.inf)
+
+        super().__init__(
+            coil,
+            ["Z"],
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            grid=grid,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        super().build(use_jit=use_jit, verbose=verbose)
+
+        # R is a pointwise geometric quantity, not an integral, so don't weight
+        # the residuals by the grid spacing
+        self._constants["quad_weights"] = 1
+
+        if self._normalize:
+            self._normalization = np.mean([scale["a"] for scale in self._scales])
+
+        _Objective.build(self, use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute coil Z.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of the coil's degrees of freedom.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants. (Deprecated)
+
+        Returns
+        -------
+        f : array of floats
+            1D array of Z values at each grid node of each coil.
+
+        """
+        data = super().compute(params, constants=constants)
+        data = tree_leaves(data, is_leaf=lambda x: isinstance(x, dict))
+        out = jnp.concatenate([dat["Z"] for dat in data])
+        return out[self._coilset_tree["objective_mask"]]
+
+
 class CoilCurrentLength(CoilLength):
     """Coil current length.
 
@@ -2488,7 +2707,8 @@ class Bxdl(_Objective):
         "_field_fixed",
         "_curve_fixed",
         "_eq_fixed",
-        "_normalize_B_mag"
+        "_normalize_B_mag",
+        "_eq_kwargs",
     ]
 
     def __init__(

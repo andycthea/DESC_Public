@@ -123,6 +123,7 @@ Coil Optimization
     desc.objectives.CoilLength
     desc.objectives.CoilCurvature
     desc.objectives.CoilTorsion
+    desc.objectives.CoilR
     desc.objectives.CoilSetLinkingNumber
     desc.objectives.CoilSetMinDistance
     desc.objectives.CoilSetToCoilSetMinDistance

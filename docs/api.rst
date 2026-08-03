@@ -205,6 +205,7 @@ Objective Functions
     desc.objectives.CoilCurvature
     desc.objectives.CoilIntegratedCurvature
     desc.objectives.CoilLength
+    desc.objectives.CoilR
     desc.objectives.CoilSetLinkingNumber
     desc.objectives.CoilSetMinDistance
     desc.objectives.CoilSetToCoilSetMinDistance
