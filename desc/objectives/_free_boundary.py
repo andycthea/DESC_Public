@@ -869,6 +869,7 @@ class BoundaryError(_Objective):
         bsq_in = jnp.sum(Bin_total * Bin_total, axis=-1)
 
         g = eval_data["|e_theta x e_zeta|"]
+        g = g / jnp.linalg.norm(g)
         Bn_err = Bn * g
         Bsq_err = jnp.where(
             eval_data["p"] == 0,
