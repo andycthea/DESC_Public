@@ -98,6 +98,16 @@ class _CoilObjective(_Objective):
             jac_chunk_size=jac_chunk_size,
         )
 
+    @property
+    def _coil(self):
+        """Coil, or nested structure of coils, that this objective acts on.
+
+        ``self.things`` is a flat list of the optimizable objects, so subclasses
+        that accept several independent coils/coilsets (and therefore have more
+        than one thing) must override this to rebuild the input structure.
+        """
+        return self.things[0]
+
     def build(self, use_jit=True, verbose=1):  # noqa:C901
         """Build constant arrays.
 
@@ -184,7 +194,7 @@ class _CoilObjective(_Objective):
                     0
                 ]
 
-        coil = self.things[0]
+        coil = self._coil
         grid = self._grid
 
         # get individual coils from coilset
@@ -291,7 +301,7 @@ class _CoilObjective(_Objective):
         """
         constants = self._get_deprecated_constants(constants)
 
-        coil = self.things[0]
+        coil = self._coil
         data = coil.compute(
             self._data_keys,
             params=params,
@@ -986,6 +996,158 @@ class CoilCurrentLength(CoilLength):
         currents = jnp.concatenate([param["current"] for param in params])
         out = jnp.atleast_1d(lengths * currents[self._coilset_tree["objective_mask"]])
         return out
+
+
+class CoilCurrentLengthSum(CoilLength):
+    """Sum of the coil current length (current * length) over all coils.
+
+    Computes the single scalar ``sum_i I_i * L_i``, where the sum runs over
+    every coil in ``coil``. Unlike ``CoilCurrentLength``, which returns one
+    residual per coil, this returns one residual total. Useful for
+    approximating HTS cost.
+
+    Parameters
+    ----------
+    coil : CoilSet, Coil, or list of CoilSet or Coil
+        Coil(s) that are to be optimized. If a list is given, each entry is a
+        separate optimizable object and the current lengths of all of them are
+        summed together.
+    grid : Grid, list, optional
+        Collocation grid containing the nodes to evaluate at.
+        If a list, must have the same structure as ``coil``.
+        Defaults to ``LinearGrid(N=2 * coil.N + 5)``
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=0``.",
+        bounds_default="``target=0``.",
+        coil=True,
+    )
+
+    _scalar = True
+    _units = "(A*m)"
+    _print_value_fmt = "Coil current length sum: "
+    _broadcast_input = "coil"
+
+    def __init__(
+        self,
+        coil,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="coil current length sum",
+        jac_chunk_size=None,
+    ):
+        if target is None and bounds is None:
+            target = 0
+
+        super().__init__(
+            coil,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            grid=grid,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    @property
+    def _coil(self):
+        """Coil structure this objective acts on.
+
+        ``_Objective.__init__`` flattens the input, so a list of coilsets shows
+        up as several separate things. Rebuild the list here so that ``build``
+        sees the same tree structure the user passed in.
+        """
+        things = self.things
+        return things[0] if len(things) == 1 else list(things)
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        # NOTE: call _CoilObjective.build directly rather than CoilLength.build
+        # so that dim_f can be collapsed to 1 before _Objective.build checks it.
+        _CoilObjective.build(self, use_jit=use_jit, verbose=verbose)
+
+        # the objective is a single scalar, not one value per coil
+        self._dim_f = 1
+        self._constants["quad_weights"] = 1
+
+        if self._normalize:
+            mean_length = np.mean([scale["a"] for scale in self._scales])
+            params = tree_leaves(
+                [thing.params_dict for thing in self.things],
+                is_leaf=lambda x: isinstance(x, dict),
+            )
+            mean_current = np.mean([np.abs(param["current"]) for param in params])
+            mean_current = np.max((mean_current, 1))
+            self._normalization = mean_current * mean_length * len(params)
+
+        _Objective.build(self, use_jit=use_jit, verbose=verbose)
+
+    def compute(self, *params, constants=None):
+        """Compute the total coil current length (sum of current * length).
+
+        Parameters
+        ----------
+        params : dict or list of dict
+            Dictionary of the degrees of freedom of each coil/coilset, one
+            positional argument per entry of ``self.things``.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self._constants. (Deprecated)
+
+        Returns
+        -------
+        f : array of floats
+            1D array of length 1 holding sum_i I_i * L_i.
+
+        """
+        constants = self._get_deprecated_constants(constants)
+
+        if len(self.things) == 1:
+            coils = [self._coil]
+            params = [params[0]]
+            transforms = [constants["transforms"]]
+            grids = [self._grid]
+        else:
+            coils = self._coil
+            params = list(params)
+            transforms = constants["transforms"]
+            grids = self._grid
+
+        data = [
+            coil.compute(self._data_keys, params=par, transforms=tr, grid=grid)
+            for coil, par, tr, grid in zip(coils, params, transforms, grids)
+        ]
+        data = tree_leaves(data, is_leaf=lambda x: isinstance(x, dict))
+        lengths = jnp.concatenate([jnp.atleast_1d(dat["length"]) for dat in data])
+        currents = jnp.concatenate(
+            [
+                jnp.atleast_1d(par["current"])
+                for par in tree_leaves(params, is_leaf=lambda x: isinstance(x, dict))
+            ]
+        )
+        mask = self._coilset_tree["objective_mask"]
+        return jnp.atleast_1d((lengths[mask] * currents[mask]).sum())
 
 
 class CoilIntegratedCurvature(_CoilObjective):
