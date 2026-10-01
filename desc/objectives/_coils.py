@@ -2761,10 +2761,15 @@ class SurfaceQuadraticFlux(_Objective):
         constants = self._get_deprecated_constants(constants)
         surf_params = params[0] if not self._surf_fixed else None
 
-        if not self._field_fixed and not self._surf_fixed:
-            field_params = params[1]
-        elif not self._field_fixed:
-            field_params = params[0]
+        # if not self._field_fixed and not self._surf_fixed:
+        #     field_params = params[1]
+        # elif not self._field_fixed:
+        #     field_params = params[0]
+        # else:
+        #     field_params = None
+
+        if not self._field_fixed:
+            field_params = params[0:] if self._surf_fixed else params[1:]
         else:
             field_params = None
 
