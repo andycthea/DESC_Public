@@ -16,6 +16,29 @@ from desc.utils import rpz2xyz_vec, xyz2rpz
 from ._core import _MagneticField
 
 
+def _map_chunked(fun, coords, chunk_size):
+    """Apply ``fun`` to ``coords`` in chunks of rows and concatenate the results.
+
+    The direct transform materializes an (n_points, n_modes) basis matrix per
+    derivative, so evaluating every point at once is what exhausts memory. The
+    last chunk is padded (repeating its final row) to ``chunk_size`` so all
+    chunks share one shape, and under jit ``fun`` is traced only once.
+    """
+    n = coords.shape[0]
+    if chunk_size is None or chunk_size >= n:
+        return fun(coords)
+    chunk_size = int(chunk_size)
+    out = []
+    for start in range(0, n, chunk_size):
+        chunk = coords[start : start + chunk_size]
+        m = chunk.shape[0]
+        if m < chunk_size:
+            pad = jnp.broadcast_to(chunk[-1:], (chunk_size - m, coords.shape[1]))
+            chunk = jnp.concatenate([chunk, pad], axis=0)
+        out.append(fun(chunk)[:m])
+    return jnp.concatenate(out, axis=0)
+
+
 class PlasmaField(_MagneticField):
     """_MagneticField subclass to compute the plasma current magnetic field.
 
@@ -149,7 +172,11 @@ class PlasmaField(_MagneticField):
         transforms : dict of Transform
             Not used for this subclass.
         chunk_size : int or None
-            Not used for this subclass.
+            Size to split computation into chunks of evaluation points.
+            If no chunking should be done or the chunk size is the full input
+            then supply ``None``. Default is ``None``. Each point builds a dense
+            row over every basis mode per derivative (tens of MB per point at
+            typical resolutions), so chunk anything beyond a handful of points.
 
         Returns
         -------
@@ -165,19 +192,21 @@ class PlasmaField(_MagneticField):
         coords = jnp.atleast_2d(coords)
         coords = xyz2rpz(coords) if basis.lower() == "xyz" else coords
 
-        # Normalize the coordinates
-        out_grid = Grid((coords - shifts) / scales, jitable=True)
-        out_transform = Transform(
-            out_grid, basis_obj, build_pinv=False, build=True, derivs=1
-        )
+        def _B(chunk):
+            # Normalize the coordinates
+            out_grid = Grid((chunk - shifts) / scales, jitable=True)
+            out_transform = Transform(
+                out_grid, basis_obj, build_pinv=False, build=True, derivs=1
+            )
+            # Calculate B as the curl of A
+            return _curl_cylindrical(
+                self._A_coeff, self._RA_phi_coeff, chunk[:, 0], out_transform, scales
+            )
 
-        # Calculate B as the curl of A
-        B = _curl_cylindrical(
-            self._A_coeff, self._RA_phi_coeff, coords[:, 0], out_transform, scales
-        )
+        B = _map_chunked(_B, coords, chunk_size)
 
         # Convert back to XYZ if necessary
-        if basis.lower == "xyz":
+        if basis.lower() == "xyz":
             B = rpz2xyz_vec(B, phi=coords[:, 1])
 
         return B
@@ -288,23 +317,25 @@ class PlasmaField(_MagneticField):
         coords = jnp.atleast_2d(coords)
         coords = xyz2rpz(coords) if basis.lower() == "xyz" else coords
 
-        # Normalize the coordinates
-        out_grid = Grid((coords - shifts) / scales)
-        out_transform = Transform(
-            out_grid, basis_obj, build_pinv=False, build=True, derivs=0
-        )
+        def _A(chunk):
+            # Normalize the coordinates
+            out_grid = Grid((chunk - shifts) / scales, jitable=True)
+            out_transform = Transform(
+                out_grid, basis_obj, build_pinv=False, build=True, derivs=0
+            )
+            # Interpolate the A grid
+            return jnp.stack(
+                [
+                    out_transform.transform(self._A_coeff[:, 0]),
+                    out_transform.transform(self._A_coeff[:, 1]),
+                    out_transform.transform(self._A_coeff[:, 2]),
+                ],
+                axis=-1,
+            )
 
-        # Interpolate the A grid
-        A = jnp.stack(
-            [
-                out_transform.transform(self._A_coeff[:, 0]),
-                out_transform.transform(self._A_coeff[:, 1]),
-                out_transform.transform(self._A_coeff[:, 2]),
-            ],
-            axis=-1,
-        )
+        A = _map_chunked(_A, coords, chunk_size)
 
-        if basis.lower == "xyz":
+        if basis.lower() == "xyz":
             A = rpz2xyz_vec(A, phi=coords[:, 1])
 
         return A
