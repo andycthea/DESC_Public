@@ -67,6 +67,7 @@ class VacuumBoundaryError(_Objective):
         "_bs_chunk_size",
         "_eq_data_keys",
         "_field_fixed",
+        "_normalize_g",
     ]
 
     _scalar = False
@@ -89,6 +90,7 @@ class VacuumBoundaryError(_Objective):
         eval_grid=None,
         field_grid=None,
         field_fixed=False,
+        normalize_g=False,
         name="Vacuum boundary error",
         jac_chunk_size=None,
         *,
@@ -103,6 +105,7 @@ class VacuumBoundaryError(_Objective):
         self._field = [field] if not isinstance(field, list) else field
         self._field_grid = field_grid
         self._field_fixed = field_fixed
+        self._normalize_g = normalize_g
         self._bs_chunk_size = bs_chunk_size
         things = [eq]
         if not field_fixed:
@@ -199,6 +202,8 @@ class VacuumBoundaryError(_Objective):
                 np.ones(grid.num_nodes) * scales["B"] ** 2 * scales["R0"] * scales["a"]
             )
             self._normalization = np.concatenate([Bn_norm, B2_norm])
+            if self._normalize_g:
+                self._normalization /= eq.compute(["|e_theta x e_zeta|"], grid=self._eval_grid)["|e_theta x e_zeta|"].sum()
 
         super().build(use_jit=use_jit, verbose=verbose)
 
@@ -250,7 +255,7 @@ class VacuumBoundaryError(_Objective):
         bsq_in = jnp.sum(Bin_total * Bin_total, axis=-1)
 
         g = data["|e_theta x e_zeta|"]
-        g = g / jnp.sum(g)
+        if self._normalize_g: g = g / jnp.sum(g)
         Bn_err = Bn * g
         Bsq_err = (bsq_in - bsq_out) * g
         return jnp.concatenate([Bn_err, Bsq_err])
@@ -456,6 +461,7 @@ class BoundaryError(_Objective):
         "_sheet_current",
         "_sheet_data_keys",
         "_use_same_grid",
+        "_normalize_g",
     ]
 
     _scalar = False
@@ -482,6 +488,7 @@ class BoundaryError(_Objective):
         eval_grid=None,
         field_grid=None,
         field_fixed=False,
+        normalize_g=False,
         eq_fixed=False,
         name="Boundary error",
         jac_chunk_size=None,
@@ -505,6 +512,7 @@ class BoundaryError(_Objective):
             "At least one of eq_fixed or field_fixed must be false.",
         )
         self._field_fixed = field_fixed
+        self._normalize_g = normalize_g
         self._eq_fixed = eq_fixed
         self._bs_chunk_size = bs_chunk_size
         B_plasma_chunk_size = parse_argname_change(
@@ -752,6 +760,9 @@ class BoundaryError(_Objective):
             if self._sheet_current:
                 self._normalization = np.concatenate([self._normalization, Bn_norm])
 
+            if self._normalize_g:
+                self._normalization /= eq.compute(["|e_theta x e_zeta|"], grid=self._eval_grid)["|e_theta x e_zeta|"].sum()
+
         super().build(use_jit=use_jit, verbose=verbose)
 
     def compute(self, *params, constants=None):
@@ -870,7 +881,7 @@ class BoundaryError(_Objective):
         bsq_in = jnp.sum(Bin_total * Bin_total, axis=-1)
 
         g = eval_data["|e_theta x e_zeta|"]
-        g = g / jnp.sum(g)
+        if self._normalize_g: g = g / jnp.sum(g)
         Bn_err = Bn * g
         Bsq_err = jnp.where(
             eval_data["p"] == 0,
