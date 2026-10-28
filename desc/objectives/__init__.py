@@ -94,8 +94,10 @@ from .linear_objectives import (
     FixCurveShift,
     FixElectronDensity,
     FixElectronTemperature,
+    FixElectronTemperatureShape,
     FixIonDensity,
     FixIonTemperature,
+    FixIonTemperatureShape,
     FixIota,
     FixLambdaGauge,
     FixModeLambda,
@@ -115,6 +117,7 @@ from .linear_objectives import (
     FixSumModesLambda,
     FixSumModesR,
     FixSumModesZ,
+    FixTemperatureShapesAndRatio,
     FixThetaSFL,
     ShareParameters,
 )

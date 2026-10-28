@@ -2392,6 +2392,123 @@ class FixElectronTemperature(FixParameters):
             self._normalization = scales["T"]
         super().build(use_jit=use_jit, verbose=verbose)
 
+class FixElectronTemperatureShape(_FixedObjective):
+    """Fixes the shape of the electron temperature profile, allowing only its scale to vary.
+
+    The ratios between the electron temperature profile coefficients are held fixed at
+    their values when the objective is built, so that ``Te_l = s * Te_l0`` for some
+    free scalar ``s``. Let ``k`` be the index of the largest magnitude reference
+    coefficient. Then the constraints are ``Te_l[i] - (Te_l0[i] / Te_l0[k]) * Te_l[k]
+    = 0`` for all ``i != k``.
+
+    This is only meaningful for profiles whose value is linear in its parameters,
+    such as a PowerSeriesProfile or SplineProfile.
+
+    Parameters
+    ----------
+    eq : Equilibrium
+        Equilibrium that will be optimized to satisfy the Objective.
+    weight : {float, ndarray}, optional
+        Weighting to apply to the Objective, relative to other Objectives.
+        Must be broadcastable to ``Objective.dim_f``
+    normalize : bool, optional
+        Whether to compute the error in physical units or non-dimensionalize.
+    indices : ndarray or bool, optional
+        indices of the Profile.params array whose ratios are fixed. Coefficients not
+        in indices are left free. If True uses all of the Profile.params indices.
+    name : str, optional
+        Name of the objective function.
+
+    """
+
+    _fixed = False  # not "diagonal", since it couples coefficients
+    _units = "(eV)"
+    _print_value_fmt = "Fixed electron temperature shape error: "
+
+    def __init__(
+        self,
+        eq,
+        weight=1,
+        normalize=True,
+        indices=True,
+        name="fixed electron temperature shape",
+    ):
+        self._indices = indices
+        super().__init__(
+            things=eq,
+            target=0,
+            weight=weight,
+            name=name,
+            normalize=normalize,
+            normalize_target=normalize,
+        )
+
+    def build(self, use_jit=False, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        eq = self.things[0]
+        if eq.electron_temperature is None:
+            raise RuntimeError(
+                "Attempting to fix electron temperature shape on an Equilibrium with no "
+                + "electron temperature profile assigned."
+            )
+        Te_l = np.asarray(eq.Te_l)
+        if self._indices is True:
+            idx = np.arange(Te_l.size)
+        else:
+            idx = np.atleast_1d(self._indices).astype(int)
+        errorif(
+            idx.size < 2,
+            ValueError,
+            "FixElectronTemperatureShape requires at least 2 coefficients, "
+            + f"got {idx.size}.",
+        )
+        c0 = Te_l[idx]
+        k = np.argmax(np.abs(c0))
+        errorif(
+            c0[k] == 0,
+            ValueError,
+            "Cannot fix the shape of an electron temperature profile with all zero "
+            + "coefficients.",
+        )
+        others = np.delete(np.arange(idx.size), k)
+        self._dim_f = others.size
+
+        self._A = np.zeros((self._dim_f, Te_l.size))
+        self._A[np.arange(self._dim_f), idx[others]] = 1
+        self._A[:, idx[k]] = -c0[others] / c0[k]
+
+        if self._normalize:
+            scales = compute_scaling_factors(eq)
+            self._normalization = scales["T"]
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute electron temperature shape errors.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of equilibrium degrees of freedom, eg Equilibrium.params_dict
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants. (Deprecated)
+
+        Returns
+        -------
+        f : ndarray
+            Electron temperature shape errors.
+
+        """
+        return jnp.dot(self._A, params["Te_l"])
 
 class FixElectronDensity(FixParameters):
     """Fixes electron density profile coefficients.
@@ -2557,6 +2674,260 @@ class FixIonTemperature(FixParameters):
             scales = compute_scaling_factors(eq)
             self._normalization = scales["T"]
         super().build(use_jit=use_jit, verbose=verbose)
+
+
+class FixIonTemperatureShape(_FixedObjective):
+    """Fixes the shape of the ion temperature profile, allowing only its scale to vary.
+
+    The ratios between the ion temperature profile coefficients are held fixed at
+    their values when the objective is built, so that ``Ti_l = s * Ti_l0`` for some
+    free scalar ``s``. Let ``k`` be the index of the largest magnitude reference
+    coefficient. Then the constraints are ``Ti_l[i] - (Ti_l0[i] / Ti_l0[k]) * Ti_l[k]
+    = 0`` for all ``i != k``.
+
+    This is only meaningful for profiles whose value is linear in its parameters,
+    such as a PowerSeriesProfile or SplineProfile.
+
+    Parameters
+    ----------
+    eq : Equilibrium
+        Equilibrium that will be optimized to satisfy the Objective.
+    weight : {float, ndarray}, optional
+        Weighting to apply to the Objective, relative to other Objectives.
+        Must be broadcastable to ``Objective.dim_f``
+    normalize : bool, optional
+        Whether to compute the error in physical units or non-dimensionalize.
+    indices : ndarray or bool, optional
+        indices of the Profile.params array whose ratios are fixed. Coefficients not
+        in indices are left free. If True uses all of the Profile.params indices.
+    name : str, optional
+        Name of the objective function.
+
+    """
+
+    _fixed = False  # not "diagonal", since it couples coefficients
+    _units = "(eV)"
+    _print_value_fmt = "Fixed ion temperature shape error: "
+
+    def __init__(
+        self,
+        eq,
+        weight=1,
+        normalize=True,
+        indices=True,
+        name="fixed ion temperature shape",
+    ):
+        self._indices = indices
+        super().__init__(
+            things=eq,
+            target=0,
+            weight=weight,
+            name=name,
+            normalize=normalize,
+            normalize_target=normalize,
+        )
+
+    def build(self, use_jit=False, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        eq = self.things[0]
+        if eq.ion_temperature is None:
+            raise RuntimeError(
+                "Attempting to fix ion temperature shape on an Equilibrium with no "
+                + "ion temperature profile assigned."
+            )
+        Ti_l = np.asarray(eq.Ti_l)
+        if self._indices is True:
+            idx = np.arange(Ti_l.size)
+        else:
+            idx = np.atleast_1d(self._indices).astype(int)
+        errorif(
+            idx.size < 2,
+            ValueError,
+            "FixIonTemperatureShape requires at least 2 coefficients, "
+            + f"got {idx.size}.",
+        )
+        c0 = Ti_l[idx]
+        k = np.argmax(np.abs(c0))
+        errorif(
+            c0[k] == 0,
+            ValueError,
+            "Cannot fix the shape of an ion temperature profile with all zero "
+            + "coefficients.",
+        )
+        others = np.delete(np.arange(idx.size), k)
+        self._dim_f = others.size
+
+        self._A = np.zeros((self._dim_f, Ti_l.size))
+        self._A[np.arange(self._dim_f), idx[others]] = 1
+        self._A[:, idx[k]] = -c0[others] / c0[k]
+
+        if self._normalize:
+            scales = compute_scaling_factors(eq)
+            self._normalization = scales["T"]
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute ion temperature shape errors.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of equilibrium degrees of freedom, eg Equilibrium.params_dict
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants. (Deprecated)
+
+        Returns
+        -------
+        f : ndarray
+            Ion temperature shape errors.
+
+        """
+        return jnp.dot(self._A, params["Ti_l"])
+
+
+class FixTemperatureShapesAndRatio(_FixedObjective):
+    """Fixes the shapes of the ion and electron temperature profiles and their ratio.
+
+    The ratios between all of the ion and electron temperature profile coefficients
+    are held fixed at their values when the objective is built, so that
+    ``(Ti_l, Te_l) = s * (Ti_l0, Te_l0)`` for some free scalar ``s``. This fixes the
+    shape of each profile and the ratio between their scales, while still allowing
+    both profiles to be scaled together. Let ``c = (Ti_l, Te_l)`` and ``k`` be the
+    index of the largest magnitude reference coefficient. Then the constraints are
+    ``c[i] - (c0[i] / c0[k]) * c[k] = 0`` for all ``i != k``.
+
+    This is only meaningful for profiles whose value is linear in its parameters,
+    such as a PowerSeriesProfile or SplineProfile.
+
+    Parameters
+    ----------
+    eq : Equilibrium
+        Equilibrium that will be optimized to satisfy the Objective.
+    weight : {float, ndarray}, optional
+        Weighting to apply to the Objective, relative to other Objectives.
+        Must be broadcastable to ``Objective.dim_f``
+    normalize : bool, optional
+        Whether to compute the error in physical units or non-dimensionalize.
+    ion_indices : ndarray or bool, optional
+        indices of the ion temperature Profile.params array whose ratios are fixed.
+        Coefficients not in indices are left free. If True uses all of the
+        Profile.params indices.
+    electron_indices : ndarray or bool, optional
+        indices of the electron temperature Profile.params array whose ratios are
+        fixed. Coefficients not in indices are left free. If True uses all of the
+        Profile.params indices.
+    name : str, optional
+        Name of the objective function.
+
+    """
+
+    _fixed = False  # not "diagonal", since it couples coefficients
+    _units = "(eV)"
+    _print_value_fmt = "Fixed temperature shapes and ratio error: "
+
+    def __init__(
+        self,
+        eq,
+        weight=1,
+        normalize=True,
+        ion_indices=True,
+        electron_indices=True,
+        name="fixed temperature shapes and ratio",
+    ):
+        self._ion_indices = ion_indices
+        self._electron_indices = electron_indices
+        super().__init__(
+            things=eq,
+            target=0,
+            weight=weight,
+            name=name,
+            normalize=normalize,
+            normalize_target=normalize,
+        )
+
+    def build(self, use_jit=False, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        eq = self.things[0]
+        if eq.ion_temperature is None or eq.electron_temperature is None:
+            raise RuntimeError(
+                "Attempting to fix temperature shapes on an Equilibrium without both "
+                + "ion and electron temperature profiles assigned."
+            )
+        Ti_l = np.asarray(eq.Ti_l)
+        Te_l = np.asarray(eq.Te_l)
+        if self._ion_indices is True:
+            ion_idx = np.arange(Ti_l.size)
+        else:
+            ion_idx = np.atleast_1d(self._ion_indices).astype(int)
+        if self._electron_indices is True:
+            electron_idx = np.arange(Te_l.size)
+        else:
+            electron_idx = np.atleast_1d(self._electron_indices).astype(int)
+        # indices into the concatenated coefficients (Ti_l, Te_l)
+        idx = np.concatenate([ion_idx, Ti_l.size + electron_idx])
+        errorif(
+            idx.size < 2,
+            ValueError,
+            "FixTemperatureShapesAndRatio requires at least 2 coefficients, "
+            + f"got {idx.size}.",
+        )
+        c0 = np.concatenate([Ti_l, Te_l])[idx]
+        k = np.argmax(np.abs(c0))
+        errorif(
+            c0[k] == 0,
+            ValueError,
+            "Cannot fix the shapes of temperature profiles with all zero "
+            + "coefficients.",
+        )
+        others = np.delete(np.arange(idx.size), k)
+        self._dim_f = others.size
+
+        self._A = np.zeros((self._dim_f, Ti_l.size + Te_l.size))
+        self._A[np.arange(self._dim_f), idx[others]] = 1
+        self._A[:, idx[k]] = -c0[others] / c0[k]
+
+        if self._normalize:
+            scales = compute_scaling_factors(eq)
+            self._normalization = scales["T"]
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute temperature shapes and ratio errors.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of equilibrium degrees of freedom, eg Equilibrium.params_dict
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants. (Deprecated)
+
+        Returns
+        -------
+        f : ndarray
+            Temperature shapes and ratio errors.
+
+        """
+        return jnp.dot(self._A, jnp.concatenate([params["Ti_l"], params["Te_l"]]))
 
 
 class FixIonDensity(FixParameters):

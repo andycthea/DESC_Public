@@ -225,7 +225,10 @@ Objective Functions
     desc.objectives.FixCurrent
     desc.objectives.FixElectronDensity
     desc.objectives.FixElectronTemperature
+    desc.objectives.FixElectronTemperatureShape
     desc.objectives.FixIonTemperature
+    desc.objectives.FixIonTemperatureShape
+    desc.objectives.FixTemperatureShapesAndRatio
     desc.objectives.FixIota
     desc.objectives.FixModeR
     desc.objectives.FixModeZ

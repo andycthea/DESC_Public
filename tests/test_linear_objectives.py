@@ -26,7 +26,9 @@ from desc.objectives import (
     FixCurrent,
     FixElectronDensity,
     FixElectronTemperature,
+    FixElectronTemperatureShape,
     FixIonTemperature,
+    FixIonTemperatureShape,
     FixIota,
     FixLambdaGauge,
     FixModeLambda,
@@ -45,6 +47,7 @@ from desc.objectives import (
     FixSumModesLambda,
     FixSumModesR,
     FixSumModesZ,
+    FixTemperatureShapesAndRatio,
     FixThetaSFL,
     ForceBalance,
     GenericObjective,
@@ -398,7 +401,10 @@ def test_kinetic_constraints():
         FixAtomicNumber(eq=eqp),
         FixElectronDensity(eq=eqp),
         FixElectronTemperature(eq=eqp),
+        FixElectronTemperatureShape(eq=eqp),
         FixIonTemperature(eq=eqp),
+        FixIonTemperatureShape(eq=eqp),
+        FixTemperatureShapesAndRatio(eq=eqp),
     )
     for con in pcon:
         with pytest.raises(RuntimeError):
@@ -406,6 +412,101 @@ def test_kinetic_constraints():
     for con in kcon:
         with pytest.raises(RuntimeError):
             con.build()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "con_cls, param, name",
+    [
+        (FixIonTemperatureShape, "Ti_l", "Ti"),
+        (FixElectronTemperatureShape, "Te_l", "Te"),
+    ],
+)
+def test_fix_temperature_shape(con_cls, param, name):
+    """Test that temperature shape constraints only allow the profile to be scaled."""
+    T = PowerSeriesProfile([2e3, -1.5e3, -5e2], modes=[0, 2, 4])
+    eq = Equilibrium(
+        L=4,
+        M=2,
+        N=0,
+        electron_temperature=T,
+        electron_density=PowerSeriesProfile([1e20, 0, -1e20]),
+        ion_temperature=T.copy(),
+    )
+    T_l0 = np.asarray(eq.params_dict[param]).copy()
+    con = con_cls(eq)
+    con.build()
+    assert con.dim_f == T_l0.size - 1
+    np.testing.assert_allclose(con.compute({param: 3 * T_l0}), 0, atol=1e-10)
+    assert np.any(np.abs(con.compute({param: T_l0 + [0, 1, 0]})) > 0)
+
+    # null space of the constraint should only rescale the profile
+    obj = ObjectiveFunction(GenericObjective(name, eq))
+    obj.build()
+    cons = ObjectiveFunction(con_cls(eq))
+    cons.build()
+    _, _, _, _, _, _, project, recover, *_ = factorize_linear_constraints(obj, cons)
+    y = project(obj.x(eq))
+    rng = np.random.default_rng(0)
+    for _ in range(3):
+        x = recover(y + rng.normal(size=y.size))
+        T_l = obj.unpack_state(x, per_objective=False)[0][param]
+        ratio = T_l / T_l0
+        np.testing.assert_allclose(ratio, ratio[0], rtol=1e-10)
+
+    # only the ratio between the given indices is fixed
+    con = con_cls(eq, indices=[0, 2])
+    con.build()
+    np.testing.assert_allclose(con._A, [[0.25, 0, 1]])
+
+
+@pytest.mark.unit
+def test_fix_temperature_shapes_and_ratio():
+    """Test that Ti and Te can only be scaled together by the same factor."""
+    eq = Equilibrium(
+        L=4,
+        M=2,
+        N=0,
+        electron_temperature=PowerSeriesProfile([1e3, -1e3], modes=[0, 2]),
+        electron_density=PowerSeriesProfile([1e20, 0, -1e20]),
+        ion_temperature=PowerSeriesProfile([2e3, -1.5e3, -5e2], modes=[0, 2, 4]),
+    )
+    Ti_l0 = np.asarray(eq.Ti_l).copy()
+    Te_l0 = np.asarray(eq.Te_l).copy()
+    con = FixTemperatureShapesAndRatio(eq)
+    con.build()
+    assert con.dim_f == Ti_l0.size + Te_l0.size - 1
+    f = con.compute({"Ti_l": 3 * Ti_l0, "Te_l": 3 * Te_l0})
+    np.testing.assert_allclose(f, 0, atol=1e-10)
+    # scaling only one profile changes the ratio between them
+    f = con.compute({"Ti_l": 3 * Ti_l0, "Te_l": Te_l0})
+    assert np.any(np.abs(f) > 0)
+    f = con.compute({"Ti_l": Ti_l0, "Te_l": 3 * Te_l0})
+    assert np.any(np.abs(f) > 0)
+
+    # null space of the constraint should only rescale both profiles together
+    obj = ObjectiveFunction(GenericObjective("Ti", eq))
+    obj.build()
+    cons = ObjectiveFunction(FixTemperatureShapesAndRatio(eq))
+    cons.build()
+    _, _, _, _, _, _, project, recover, *_ = factorize_linear_constraints(obj, cons)
+    y = project(obj.x(eq))
+    c0 = np.concatenate([Ti_l0, Te_l0])
+    nonzero = c0 != 0
+    assert not np.all(nonzero)  # Te_l is padded with zeros up to eq.L
+    rng = np.random.default_rng(0)
+    for _ in range(3):
+        x = recover(y + rng.normal(size=y.size))
+        params = obj.unpack_state(x, per_objective=False)[0]
+        c = np.concatenate([params["Ti_l"], params["Te_l"]])
+        ratio = c[nonzero] / c0[nonzero]
+        np.testing.assert_allclose(ratio, ratio[0], rtol=1e-10)
+        np.testing.assert_allclose(c[~nonzero], 0, atol=1e-10)
+
+    # only the ratios between the given indices are fixed
+    con = FixTemperatureShapesAndRatio(eq, ion_indices=[0], electron_indices=[1])
+    con.build()
+    np.testing.assert_allclose(con._A, [[0.5, 0, 0, 0, 1, 0]])
 
 
 @pytest.mark.unit
