@@ -138,6 +138,7 @@ Grid
     desc.grid.Grid
     desc.grid.LinearGrid
     desc.grid.QuadratureGrid
+    desc.grid.QuadratureGridOffset
     desc.grid.find_least_rational_surfaces
     desc.grid.find_most_rational_surfaces
 

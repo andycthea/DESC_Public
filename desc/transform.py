@@ -204,7 +204,8 @@ class Transform(IOAble):
             self._method = "direct1"
             return
 
-        if not grid.fft_toroidal:
+        zeta_offset = getattr(grid, "fft_zeta_offset", None)
+        if not (grid.fft_toroidal or zeta_offset is not None):
             warnings.warn(
                 colored(
                     "fft method requires compatible grid, got {}".format(grid)
@@ -255,6 +256,13 @@ class Transform(IOAble):
         self.num_n_modes = 2 * basis.N + 1  # number of toroidal modes
         self.pad_dim = self.grid.num_zeta - self.num_n_modes
         self.dk = basis.NFP * np.arange(-basis.N, basis.N + 1).reshape((1, -1))
+        # shift theorem: toroidal nodes offset by zeta_offset multiply each positive
+        # frequency coefficient by exp(i k zeta_offset)
+        self.fft_phase = (
+            np.exp(1j * basis.NFP * np.arange(1, basis.N + 1) * zeta_offset)
+            if zeta_offset
+            else None
+        )
         row = np.where(
             (basis.modes[:, None, :2] == self.lm_modes[None, :, :]).all(axis=-1)
         )[1]
@@ -280,7 +288,11 @@ class Transform(IOAble):
 
         from desc.grid import LinearGrid
 
-        if not (grid.fft_toroidal or isinstance(grid, LinearGrid)):
+        if not (
+            grid.fft_toroidal
+            or isinstance(grid, LinearGrid)
+            or getattr(grid, "fft_zeta_offset", None) is not None
+        ):
             warnings.warn(
                 colored(
                     "direct2 method requires compatible grid, got {}".format(grid)
@@ -620,6 +632,8 @@ class Transform(IOAble):
             c_cplx = (self.grid.num_zeta / 2) * (
                 c_diff[:, self.basis.N + 1 :] - 1j * c_diff[:, self.basis.N - 1 :: -1]
             )
+            if self.fft_phase is not None:
+                c_cplx = c_cplx * self.fft_phase
             c_pad = jnp.hstack(
                 (
                     self.grid.num_zeta * c_diff[:, self.basis.N, jnp.newaxis],
@@ -704,6 +718,8 @@ class Transform(IOAble):
             c_fft = jnp.matmul(Ainv, x.reshape((Ainv.shape[1], -1), order="F"))
             c_cplx = jnp.fft.fft(c_fft)
             c_unpad = c_cplx[:, 1 : (c_cplx.shape[1] - self.pad_dim - 1) // 2 + 1]
+            if self.fft_phase is not None:
+                c_unpad = c_unpad * jnp.conj(self.fft_phase)
             c0 = c_cplx[:, :1].real / self.grid.num_zeta
             c2 = c_unpad.real / (self.grid.num_zeta / 2)
             c1 = -c_unpad.imag[:, ::-1] / (self.grid.num_zeta / 2)
@@ -769,6 +785,8 @@ class Transform(IOAble):
             a = jnp.fft.fft(A.T @ y.reshape((A.shape[0], -1), order="F"))
             cdn = a[:, 0]
             cr = a[:, 1 : 1 + self.basis.N]
+            if self.fft_phase is not None:
+                cr = cr * jnp.conj(self.fft_phase)
             b = jnp.hstack(
                 [-cr.imag[:, ::-1], cdn.real[:, np.newaxis], cr.real]
             ).flatten()[self.fft_index]

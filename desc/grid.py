@@ -13,6 +13,7 @@ __all__ = [
     "Grid",
     "LinearGrid",
     "QuadratureGrid",
+    "QuadratureGridOffset",
     "ConcentricGrid",
     "find_least_rational_surfaces",
     "find_most_rational_surfaces",
@@ -1641,6 +1642,68 @@ class QuadratureGrid(_Grid):
                 self._inverse_zeta_idx,
             ) = self._find_unique_inverse_nodes()
             self._weights = self.spacing.prod(axis=1)  # instead of _scale_weights
+
+
+class QuadratureGridOffset(QuadratureGrid):
+    """Grid used for numerical quadrature, offset by half a node in zeta.
+
+    Same as ``QuadratureGrid``, but the toroidal nodes are shifted by half the
+    toroidal node spacing, so that none of them lie on the ζ=0 plane or coincide
+    with the nodes of a ``QuadratureGrid`` of the same resolution.
+    Exactly integrates a Fourier-Zernike basis of resolution (L,M,N).
+    This grid is never symmetric.
+
+    Parameters
+    ----------
+    L : int
+        radial grid resolution (exactly integrates radial modes up to order L)
+    M : int
+        poloidal grid resolution (exactly integrates poloidal modes up to order M)
+    N : int
+        toroidal grid resolution (exactly integrates toroidal modes up to order N)
+    NFP : int
+        number of field periods (Default = 1)
+
+    """
+
+    # Not fft_toroidal, since other fft code (e.g. can_fft2) assumes the first
+    # toroidal node is at zeta=0. Transform handles the offset via fft_zeta_offset.
+    _fft_toroidal = False
+
+    @property
+    def fft_zeta_offset(self):
+        """float: Offset of the toroidal nodes from those of an fft_toroidal grid.
+
+        Transform uses this to apply the fft method with a phase shift.
+        """
+        return np.pi / ((2 * self.N + 1) * self.NFP)
+
+    def _create_nodes(self, L=1, M=1, N=1, NFP=1):
+        """Create grid nodes and weights.
+
+        Parameters
+        ----------
+        L : int
+            radial grid resolution (L radial nodes, Default = 1)
+        M : int
+            poloidal grid resolution (M poloidal nodes, Default = 1)
+        N : int
+            toroidal grid resolution (N toroidal nodes, Default = 1)
+        NFP : int
+            number of field periods (Default = 1)
+
+        Returns
+        -------
+        nodes : ndarray of float, size(num_nodes,3)
+            node coordinates, in (rho,theta,zeta)
+        spacing : ndarray of float, size(num_nodes,3)
+            node spacing, based on local volume around the node
+
+        """
+        nodes, spacing = super()._create_nodes(L=L, M=M, N=N, NFP=NFP)
+        # shift by half the distance between toroidal nodes
+        nodes[:, 2] += np.pi / ((2 * N + 1) * NFP)
+        return nodes, spacing
 
 
 class ConcentricGrid(_Grid):
