@@ -11,6 +11,7 @@ from desc.grid import (
     CylindricalGrid,
     Grid,
     LinearGrid,
+    LinearGridOffset,
     QuadratureGrid,
     dec_to_cf,
     find_least_rational_surfaces,
@@ -18,6 +19,7 @@ from desc.grid import (
     most_rational,
 )
 from desc.profiles import PowerSeriesProfile
+from desc.transform import Transform
 
 
 class TestGrid:
@@ -439,6 +441,54 @@ class TestGrid:
         # and this test assumes drho to be a constant for grids without duplicates.
         test(lg_2_sym, unique_theta_and_reflection_count=ntheta - endpoint)
         test(lg_3_sym, unique_theta_and_reflection_count=ntheta - endpoint)
+
+    @pytest.mark.unit
+    def test_linear_grid_offset(self):
+        """Test node placement and transforms on a LinearGridOffset."""
+        L, M, N, NFP = 2, 3, 4, 3
+        g = LinearGridOffset(L, M, N, NFP)
+        g0 = LinearGrid(L, M, N, NFP)
+        dz = 2 * np.pi / ((2 * N + 1) * NFP)
+        np.testing.assert_allclose(g.nodes[:, :2], g0.nodes[:, :2])
+        np.testing.assert_allclose(g.nodes[:, 2], g0.nodes[:, 2] + dz / 2)
+        np.testing.assert_allclose(g.spacing, g0.spacing)
+        np.testing.assert_allclose(g.weights, g0.weights)
+        assert g.num_zeta == 2 * N + 1
+        np.testing.assert_allclose(g.fft_zeta_offset, dz / 2)
+        assert not g.fft_toroidal and not g.can_fft2
+        assert np.all(g.nodes[:, 2] < 2 * np.pi / NFP)
+
+        # integer zeta, and change_resolution keeps the offset
+        g = LinearGridOffset(rho=1, M=M, zeta=6, NFP=NFP)
+        np.testing.assert_allclose(
+            g.nodes[g.unique_zeta_idx, 2], (np.arange(6) + 0.5) * 2 * np.pi / (6 * NFP)
+        )
+        g.change_resolution(L, M, N + 1, NFP)
+        np.testing.assert_allclose(
+            g.nodes[g.unique_zeta_idx, 2],
+            (np.arange(2 * N + 3) + 0.5) * 2 * np.pi / ((2 * N + 3) * NFP),
+        )
+
+        # transforms with the fft method match the direct method
+        from desc.basis import FourierZernikeBasis
+
+        g = LinearGridOffset(L, M, N, NFP)
+        basis = FourierZernikeBasis(L=2, M=2, N=N, NFP=NFP)
+        c = np.random.default_rng(0).normal(size=basis.num_modes)
+        for d in [[0, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 2]]:
+            f_fft = Transform(g, basis, derivs=1 + max(d), method="fft")
+            f_dir = Transform(g, basis, derivs=1 + max(d), method="direct1")
+            assert f_fft.method == "fft"
+            np.testing.assert_allclose(
+                f_fft.transform(c, *d), f_dir.transform(c, *d), atol=1e-12
+            )
+
+        with pytest.raises(ValueError):
+            LinearGridOffset(M=M, zeta=np.array([0.1, 0.2]))
+        with pytest.raises(ValueError):
+            LinearGridOffset(M=M)
+        with pytest.raises(ValueError):
+            LinearGridOffset(M=M, N=N, endpoint=True)
 
     @pytest.mark.unit
     def test_concentric_grid(self):

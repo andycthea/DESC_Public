@@ -12,6 +12,7 @@ from desc.utils import Index, check_nonnegint, check_posint, errorif, setdefault
 __all__ = [
     "Grid",
     "LinearGrid",
+    "LinearGridOffset",
     "QuadratureGrid",
     "QuadratureGridOffset",
     "ConcentricGrid",
@@ -1509,6 +1510,130 @@ class LinearGrid(_Grid):
     def endpoint(self):
         """bool: Whether the grid is made of open or closed intervals."""
         return self.__dict__.setdefault("_endpoint", False)
+
+
+class LinearGridOffset(LinearGrid):
+    """Grid in which the nodes are linearly spaced, offset by half a node in zeta.
+
+    Same as ``LinearGrid``, but the toroidal nodes are shifted by half the toroidal
+    node spacing, so that none of them lie on the ζ=0 plane or coincide with the
+    nodes of a ``LinearGrid`` of the same resolution. The toroidal nodes must be
+    equally spaced over a field period, so either ``N`` or an integer number of
+    ``zeta`` nodes must be given, and ``endpoint`` must be False.
+
+    Parameters
+    ----------
+    L : int, optional
+        Radial grid resolution.
+    M : int, optional
+        Poloidal grid resolution.
+    N : int, optional
+        Toroidal grid resolution.
+    NFP : int
+        Number of field periods (Default = 1).
+        Change this only if your nodes are placed within one field period
+        or should be interpreted as spanning one field period.
+    sym : bool
+        ``True`` for poloidal up/down symmetry, ``False`` otherwise.
+        Default is ``False``. See ``LinearGrid``.
+    axis : bool
+        True to include a point at rho=0 (default), False for rho[0] = rho[1]/2.
+    endpoint : bool
+        Must be False, since the offset toroidal nodes can not include an endpoint.
+    rho : int or ndarray of float, optional
+        Radial coordinates (Default = 1.0).
+        Alternatively, the number of radial coordinates (if an integer).
+        Note that if supplied the values may be reordered in the resulting grid.
+    theta : int or ndarray of float, optional
+        Poloidal coordinates (Default = 0.0).
+        Alternatively, the number of poloidal coordinates (if an integer).
+        Note that if supplied the values may be reordered in the resulting grid.
+    zeta : int, optional
+        Number of toroidal coordinates.
+    """
+
+    @property
+    def fft_zeta_offset(self):
+        """float: Offset of the toroidal nodes from those of an fft_toroidal grid.
+
+        Transform uses this to apply the fft method with a phase shift.
+        """
+        return np.pi / (self.num_zeta * self.NFP)
+
+    def _create_nodes(
+        self,
+        L=None,
+        M=None,
+        N=None,
+        NFP=1,
+        axis=True,
+        endpoint=False,
+        rho=1.0,
+        theta=0.0,
+        zeta=0.0,
+    ):
+        """Create grid nodes and weights.
+
+        Parameters
+        ----------
+        L : int, optional
+            Radial grid resolution.
+        M : int, optional
+            Poloidal grid resolution.
+        N : int, optional
+            Toroidal grid resolution.
+        NFP : int
+            Number of field periods (Default = 1).
+        axis : bool
+            True to include a point at rho=0 (default), False for rho[0] = rho[1]/2.
+        endpoint : bool
+            Must be False.
+        rho : int or ndarray of float, optional
+            Radial coordinates (Default = 1.0).
+            Alternatively, the number of radial coordinates (if an integer).
+        theta : int or ndarray of float, optional
+            Poloidal coordinates (Default = 0.0).
+            Alternatively, the number of poloidal coordinates (if an integer).
+        zeta : int, optional
+            Number of toroidal coordinates.
+
+        Returns
+        -------
+        nodes : ndarray of float, size(num_nodes,3)
+            node coordinates, in (rho,theta,zeta)
+        spacing : ndarray of float, size(num_nodes,3)
+            node spacing, based on local volume around the node
+
+        """
+        errorif(
+            N is None
+            and not (np.isscalar(zeta) and int(zeta) == zeta and zeta > 0),
+            ValueError,
+            "LinearGridOffset requires N or an integer number of zeta nodes, "
+            f"got N={N}, zeta={zeta}.",
+        )
+        errorif(
+            endpoint, ValueError, "LinearGridOffset does not support endpoint=True."
+        )
+        nodes, spacing = super()._create_nodes(
+            L=L,
+            M=M,
+            N=N,
+            NFP=NFP,
+            axis=axis,
+            endpoint=endpoint,
+            rho=rho,
+            theta=theta,
+            zeta=zeta,
+        )
+        num_zeta = 2 * N + 1 if N is not None else int(zeta)
+        # shift by half the distance between toroidal nodes
+        nodes[:, 2] += np.pi / (num_zeta * NFP)
+        # Not fft_toroidal, since other fft code (e.g. can_fft2) assumes the first
+        # toroidal node is at zeta=0. Transform handles the offset via fft_zeta_offset.
+        self._fft_toroidal = False
+        self._can_fft2 = False
+        return nodes, spacing
 
 
 class QuadratureGrid(_Grid):
