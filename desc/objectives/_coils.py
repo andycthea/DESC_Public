@@ -13,6 +13,7 @@ from desc.compute.utils import _compute as compute_fun
 from desc.geometry import FourierRZCuspedSurface
 from desc.grid import Grid, LinearGrid, QuadratureGrid, _Grid
 from desc.integrals import compute_B_plasma
+from desc.integrals.singularities import _kernel_biot_savart
 from desc.utils import (
     Timer,
     broadcast_tree,
@@ -2569,6 +2570,46 @@ class QuadraticFlux(_Objective):
         return f
 
 
+def _get_eq_field_grid_and_transforms(eq, eq_grid, eq_method):
+    """Return source grid and transforms for computing B_plasma from eq."""
+    if eq_grid is None:
+        if eq_method == "virtual casing":
+            eq_grid = LinearGrid(
+                rho=np.array([1.0]),
+                M=2 * eq.M_grid,
+                N=2 * eq.N_grid,
+                NFP=eq.NFP if eq.N > 0 else 64,
+                sym=False,
+            )
+        else:
+            eq_grid = QuadratureGrid(
+                L=2 * eq.L_grid, M=2 * eq.M_grid, N=2 * eq.N_grid, NFP=eq.NFP
+            )
+    if eq_method == "virtual casing":
+        eq_data_keys = _kernel_biot_savart.keys
+    else:
+        eq_data_keys = ["J", "phi", "sqrt(g)", "x"]
+    transforms = get_transforms(eq_data_keys, obj=eq, grid=eq_grid)
+    return eq_grid, transforms
+
+
+def _check_eq_method(eq_method, eq_kwargs):
+    """Validate and normalize the method for computing B_plasma from eq."""
+    eq_method = eq_method.lower().strip()
+    errorif(
+        eq_method not in ["biot-savart", "virtual casing"],
+        ValueError,
+        f"eq_method must be 'biot-savart' or 'virtual casing', got {eq_method}.",
+    )
+    errorif(
+        "method" in eq_kwargs,
+        ValueError,
+        "Pass the method for computing the plasma field as `eq_method`, "
+        "not in `eq_kwargs`.",
+    )
+    return eq_method
+
+
 class SurfaceQuadraticFlux(_Objective):
     """Target B*n = 0 on a surface.
 
@@ -2605,6 +2646,27 @@ class SurfaceQuadraticFlux(_Objective):
         Size to split Biot-Savart computation into chunks of evaluation points.
         If no chunking should be done or the chunk size is the full input
         then supply ``None``.
+    eq : Equilibrium, optional
+        Equilibrium to compute the B_plasma contribution from on the surface.
+    eq_grid : Grid, optional
+        Collocation grid containing the nodes in the equilibrium to compute the plasma
+        magnetic field from. Should be a volume grid for ``eq_method="biot-savart"``
+        and a surface grid (``rho=[1.0]``, ``sym=False``) for
+        ``eq_method="virtual casing"``.
+        Default grid for ``"biot-savart"`` is: ``QuadratureGrid(L=2*eq.L_grid,
+        M=2*eq.M_grid, N=2*eq.N_grid, NFP=eq.NFP)``.
+        Default grid for ``"virtual casing"`` is: ``LinearGrid(rho=1, M=2*eq.M_grid,
+        N=2*eq.N_grid, NFP=eq.NFP if eq.N > 0 else 64, sym=False)``.
+    eq_method : {"biot-savart", "virtual casing"}, optional
+        Method used to compute the plasma magnetic field from the equilibrium. See
+        ``Equilibrium.compute_magnetic_field``. Virtual casing is only valid for
+        evaluation points strictly outside the plasma boundary.
+        Default is ``"biot-savart"``.
+    eq_kwargs : dict, optional
+        Additional keyword arguments to pass to the equilibrium's
+        ``compute_magnetic_field`` method.
+    eq_fixed : bool, optional
+        True if the equilibrium is fixed in the optimization. Default is True.
 
     """
 
@@ -2613,7 +2675,7 @@ class SurfaceQuadraticFlux(_Objective):
         bounds_default="``target=0``.",
     )
 
-    _static_attrs = _Objective._static_attrs + ["_bs_chunk_size", "_field_fixed", "_surf_fixed", "_normalize_B_mag", "_normalize_g_mag", "_exclude_g"]
+    _static_attrs = _Objective._static_attrs + ["_bs_chunk_size", "_field_fixed", "_surf_fixed", "_normalize_B_mag", "_normalize_g_mag", "_exclude_g", "_eq_fixed", "_eq_kwargs", "_eq_method"]
 
     _scalar = False
     _linear = False
@@ -2641,12 +2703,22 @@ class SurfaceQuadraticFlux(_Objective):
         jac_chunk_size=None,
         *,
         bs_chunk_size=None,
+        eq=None,
+        eq_grid=None,
+        eq_method="biot-savart",
+        eq_kwargs={},
+        eq_fixed=True,
         **kwargs,
     ):
         if target is None and bounds is None:
             target = 0
         if not isinstance(field, list):
             field = [field]
+        self._eq = eq
+        self._eq_grid = eq_grid
+        self._eq_method = _check_eq_method(eq_method, eq_kwargs)
+        self._eq_kwargs = eq_kwargs
+        self._eq_fixed = eq_fixed
         self._eval_grid = eval_grid
         self._surface = surface
         self._field = field
@@ -2663,6 +2735,8 @@ class SurfaceQuadraticFlux(_Objective):
             things += [surface]
         if not field_fixed:
             things += field
+        if not eq_fixed and eq is not None:
+            things += [eq]
         super().__init__(
             things=things,
             target=target,
@@ -2721,6 +2795,27 @@ class SurfaceQuadraticFlux(_Objective):
             profiles=eval_profiles,
         )
 
+        eq = self._eq
+        B_plasma = None
+        if eq is not None:
+            eq_grid, eq_transforms = _get_eq_field_grid_and_transforms(
+                eq, self._eq_grid, self._eq_method
+            )
+            if self._eq_fixed and self._surf_fixed:
+                x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
+                B_plasma = eq.compute_magnetic_field(
+                    coords=x,
+                    chunk_size=self._bs_chunk_size,
+                    source_grid=eq_grid,
+                    basis="rpz",
+                    transforms=eq_transforms,
+                    method=self._eq_method,
+                    **self._eq_kwargs,
+                )
+        else:
+            eq_grid = None
+            eq_transforms = None
+
         self._constants = {
             "field": self._field,
             "field_grid": self._field_grid,
@@ -2728,6 +2823,9 @@ class SurfaceQuadraticFlux(_Objective):
             "eval_data": eval_data,
             "eval_transforms": eval_transforms,
             "eval_profiles": eval_profiles,
+            "B_plasma": B_plasma,
+            "eq_grid": eq_grid,
+            "eq_transforms": eq_transforms,
         }
 
         timer.stop("Precomputing transforms")
@@ -2769,8 +2867,13 @@ class SurfaceQuadraticFlux(_Objective):
         # else:
         #     field_params = None
 
+        # things are ordered as [surface, *fields, eq], each present only if free
+        eq_free = self._eq is not None and not self._eq_fixed
+        end_index = len(params) - 1 if eq_free else len(params)
+        eq_params = params[-1] if eq_free else None
+
         if not self._field_fixed:
-            field_params = params[0:] if self._surf_fixed else params[1:]
+            field_params = params[0:end_index] if self._surf_fixed else params[1:end_index]
         else:
             field_params = None
 
@@ -2798,6 +2901,20 @@ class SurfaceQuadraticFlux(_Objective):
             )
             if B_ext is None: B_ext = _B_ext
             else: B_ext = B_ext + _B_ext
+        if constants["B_plasma"] is not None:
+            B_ext = B_ext + constants["B_plasma"]
+        elif self._eq is not None:
+            B_plasma = self._eq.compute_magnetic_field(
+                coords=x,
+                chunk_size=self._bs_chunk_size,
+                source_grid=constants["eq_grid"],
+                params=eq_params,
+                basis="rpz",
+                transforms=constants["eq_transforms"],
+                method=self._eq_method,
+                **self._eq_kwargs,
+            )
+            B_ext = B_ext + B_plasma
         B_mag = safenorm(B_ext, axis=-1)
         B_ext = jnp.sum(B_ext * eval_data["n_rho"], axis=-1)
         if self._normalize_B_mag:
@@ -2838,9 +2955,18 @@ class Bxdl(_Objective):
         Equilibrium to compute the B_plasma contribution from at the curve.
     eq_grid : Grid, optional
         Collocation grid containing the nodes in the equilibrium to compute the plasma
-        magnetic field from.
-        Default grid is: ``QuadratureGrid(L=2*eq.L_grid, M=2*eq.M_grid, N=2 *
-        eq.N_grid, NFP=eq.NFP)``
+        magnetic field from. Should be a volume grid for ``eq_method="biot-savart"``
+        and a surface grid (``rho=[1.0]``, ``sym=False``) for
+        ``eq_method="virtual casing"``.
+        Default grid for ``"biot-savart"`` is: ``QuadratureGrid(L=2*eq.L_grid,
+        M=2*eq.M_grid, N=2*eq.N_grid, NFP=eq.NFP)``.
+        Default grid for ``"virtual casing"`` is: ``LinearGrid(rho=1, M=2*eq.M_grid,
+        N=2*eq.N_grid, NFP=eq.NFP if eq.N > 0 else 64, sym=False)``.
+    eq_method : {"biot-savart", "virtual casing"}, optional
+        Method used to compute the plasma magnetic field from the equilibrium. See
+        ``Equilibrium.compute_magnetic_field``. Virtual casing is only valid for
+        evaluation points strictly outside the plasma boundary.
+        Default is ``"biot-savart"``.
     eval_grid : Grid, optional
         Collocation grid for the points to evaluate the objective at on the curve.
         Default grid is determined by the Curve object. For a FourierRZCuspedSurface,
@@ -2886,6 +3012,7 @@ class Bxdl(_Objective):
         "_eq_fixed",
         "_normalize_B_mag",
         "_eq_kwargs",
+        "_eq_method",
         "_cusp",
     ]
 
@@ -2907,6 +3034,7 @@ class Bxdl(_Objective):
         *,
         bs_chunk_size=None,
         eq_kwargs={},
+        eq_method="biot-savart",
         field_fixed=False,
         curve_fixed=True,
         eq_fixed=True,
@@ -2925,6 +3053,7 @@ class Bxdl(_Objective):
         self._eq_grid = eq_grid
         self._bs_chunk_size = bs_chunk_size
         self._eq_kwargs = eq_kwargs
+        self._eq_method = _check_eq_method(eq_method, eq_kwargs)
         things = []
         self._field_fixed = field_fixed
         self._curve_fixed = curve_fixed
@@ -3012,14 +3141,9 @@ class Bxdl(_Objective):
         eq = self._eq
         B_plasma = None
         if self._eq is not None:
-            if self._eq_grid is None:
-                eq_grid = QuadratureGrid(
-                    L=2 * eq.L_grid, M=2 * eq.M_grid, N=2 * eq.N_grid, NFP=eq.NFP
-                )
-            else:
-                eq_grid = self._eq_grid
-            eq_data_keys = ["J", "phi", "sqrt(g)", "x"]
-            transforms = get_transforms(eq_data_keys, obj=eq, grid=eq_grid)
+            eq_grid, transforms = _get_eq_field_grid_and_transforms(
+                eq, self._eq_grid, self._eq_method
+            )
             if self._eq_fixed and self._curve_fixed:
                 x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
                 B_plasma = eq.compute_magnetic_field(
@@ -3028,6 +3152,7 @@ class Bxdl(_Objective):
                     source_grid=eq_grid,
                     basis="rpz",
                     transforms=transforms,
+                    method=self._eq_method,
                     **self._eq_kwargs,
                 )
         else:
@@ -3141,6 +3266,7 @@ class Bxdl(_Objective):
                 params=eq_params if not self._eq_fixed else None,
                 basis="rpz",
                 transforms=constants["eq_transforms"],
+                method=self._eq_method,
                 **self._eq_kwargs,
             )
             B_ext = B_ext + B_plasma
