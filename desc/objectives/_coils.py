@@ -1623,7 +1623,7 @@ class CoilSetToCoilSetMinDistance(_Objective):
 
         """
         if constants is None:
-            constants = self.constants
+            constants = self._constants
         # pts shape (num_coils, num_nodes, 3)
         pts = constants["coilset"]._compute_position(
             params=params, grid=constants["grid"], basis="xyz"
@@ -2330,7 +2330,7 @@ class CoilChargeTime(_Objective):
             Coil arclength variance.
         """
         if constants is None:
-            constants = self.constants
+            constants = self._constants
         coil_currents = jnp.array([p["current"] for p in params]).flatten()
         charge_time = (coil_currents - constants["initial_current"])
         if self._softmax_alpha is not None: charge_time = softmax(jnp.abs(charge_time), self._softmax_alpha)
@@ -3110,7 +3110,7 @@ class Bxdl(_Objective):
             field_params = params[:end_index]
 
         if constants is None:
-            constants = self.constants
+            constants = self._constants
         if self._curve_fixed:
             eval_data = constants["eval_data"]
         else:
@@ -3337,7 +3337,7 @@ class FieldOnCurve(_Objective):
             field_params = params[:end_index]
 
         if constants is None:
-            constants = self.constants
+            constants = self._constants
         if self._curve_fixed:
             eval_data = constants["eval_data"]
         else:
@@ -3778,7 +3778,7 @@ class FieldNormalError(_Objective):
     def compute(self, *params, constants=None):
         """TODO: docstring."""
         if constants is None:
-            constants = self.constants
+            constants = self._constants
 
         # Split params: field first, then curves (if free), then eq (if free).
         end_index = len(params)
@@ -3978,7 +3978,7 @@ class CurveToCurveDist(_Objective):
 
         """
         if constants is None:
-            constants = self.constants
+            constants = self._constants
 
         data_1 = self._curve_1.compute(
             self._data_keys,
