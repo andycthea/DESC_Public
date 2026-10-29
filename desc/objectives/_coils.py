@@ -10,7 +10,8 @@ from desc.backend import tree_flatten, tree_leaves, tree_map, tree_unflatten
 from desc.batching import vmap_chunked
 from desc.compute import get_profiles, get_transforms
 from desc.compute.utils import _compute as compute_fun
-from desc.grid import LinearGrid, QuadratureGrid, _Grid
+from desc.geometry import FourierRZCuspedSurface
+from desc.grid import Grid, LinearGrid, QuadratureGrid, _Grid
 from desc.integrals import compute_B_plasma
 from desc.utils import (
     Timer,
@@ -2822,10 +2823,14 @@ class Bxdl(_Objective):
     Computes field from MagneticField object(s), and optimizes them to produce a field
     which is parallel relative to a given Curve object.
 
+    If a FourierRZCuspedSurface is given instead of a Curve, the objective is evaluated
+    along its two cusps, at θ = π/2 and θ = 3π/2, with dl along e_zeta there.
+
     Parameters
     ----------
-    curve : Curve
-        Curve along which magnetic field will be optimized.
+    curve : Curve or FourierRZCuspedSurface
+        Curve along which magnetic field will be optimized, or cusped surface whose
+        cusps the magnetic field will be optimized to be parallel to.
     field : MagneticField
         External field produced by coils or other source, which will be optimized to
         minimize the perpendicular component to the Curve.
@@ -2838,7 +2843,10 @@ class Bxdl(_Objective):
         eq.N_grid, NFP=eq.NFP)``
     eval_grid : Grid, optional
         Collocation grid for the points to evaluate the objective at on the curve.
-        Default grid is determined by the Curve object.
+        Default grid is determined by the Curve object. For a FourierRZCuspedSurface,
+        the default is
+        ``LinearGrid(rho=1, theta=[π/2, 3π/2], N=2*surface.N+5, NFP=surface.NFP)``,
+        and any grid given should only have nodes on the cusps.
     field_grid : Grid, optional
         Grid used to discretize field (e.g. grid for the magnetic field source from
         coils). Default grid is determined by the specific MagneticField object, see
@@ -2850,7 +2858,8 @@ class Bxdl(_Objective):
     field_fixed : bool, optional
         Whether to fix the field's DOFs during the optimization. Default is False.
     curve_fixed : bool, optional
-        Whether to fix the curve's DOFs during the optimization. Default is True.
+        Whether to fix the curve's (or cusped surface's) DOFs during the optimization.
+        Default is True.
     eq_kwargs : dict, optional
         Additional keyword arguments to pass to the equilibrium's
         ``compute_magnetic_field`` method.
@@ -2877,6 +2886,7 @@ class Bxdl(_Objective):
         "_eq_fixed",
         "_normalize_B_mag",
         "_eq_kwargs",
+        "_cusp",
     ]
 
     def __init__(
@@ -2920,6 +2930,7 @@ class Bxdl(_Objective):
         self._curve_fixed = curve_fixed
         self._eq_fixed = eq_fixed
         self._normalize_B_mag = normalize_B_mag
+        self._cusp = isinstance(curve, FourierRZCuspedSurface)
 
         if not field_fixed:
             things += self._field
@@ -2963,23 +2974,40 @@ class Bxdl(_Objective):
         curve = self._curve
 
         if self._eval_grid is None:
-            eval_grid = LinearGrid(N=2 * curve.N + 5)
+            if self._cusp:
+                eval_grid = LinearGrid(
+                    rho=1,
+                    theta=np.array([np.pi / 2, 3 * np.pi / 2]),
+                    N=2 * curve.N + 5,
+                    NFP=curve.NFP,
+                )
+            else:
+                eval_grid = LinearGrid(N=2 * curve.N + 5)
             self._eval_grid = eval_grid
         else:
             eval_grid = self._eval_grid
 
-        self._data_keys = ["R", "Z", "phi", "ds", "frenet_tangent"]
+        if self._cusp:
+            # the cusps are lines of constant theta, so e_zeta is tangent to them
+            self._data_keys = ["R", "Z", "phi", "e_zeta"]
+        else:
+            self._data_keys = ["R", "Z", "phi", "ds", "frenet_tangent"]
 
         timer = Timer()
         if verbose > 0:
             print("Precomputing transforms")
         timer.start("Precomputing transforms")
-        if self._curve_fixed:
-            eval_data = curve.compute(self._data_keys, grid=eval_grid, basis="rpz")
+        if self._cusp:
+            # surface transforms need a concrete grid, so they can't be built in jit
+            eval_transforms = get_transforms(self._data_keys, obj=curve, grid=eval_grid)
         else:
-            eval_data = curve.compute("ds", grid=eval_grid, basis="rpz")
+            eval_transforms = None
+        eval_data = self._compute_eval_data(transforms=eval_transforms)
         self._dim_f = eval_grid.num_nodes
-        w = eval_data["ds"]
+        if self._cusp:
+            w = safenorm(eval_data["e_zeta"], axis=-1)
+        else:
+            w = eval_data["ds"]
 
         eq = self._eq
         B_plasma = None
@@ -3014,6 +3042,7 @@ class Bxdl(_Objective):
             "B_plasma": B_plasma,
             "eq_transforms": transforms,
             "eq_grid": eq_grid,
+            "eval_transforms": eval_transforms,
         }
 
         timer.stop("Precomputing transforms")
@@ -3029,6 +3058,23 @@ class Bxdl(_Objective):
         self._normalization = 1
 
         super().build(use_jit=use_jit, verbose=verbose)
+
+    def _compute_eval_data(self, params=None, transforms=None):
+        """Compute position and unit tangent along the curve or cusps."""
+        if self._cusp:
+            data = self._curve.compute(
+                self._data_keys,
+                grid=self._eval_grid,
+                params=params,
+                transforms=transforms,
+            )
+            data["frenet_tangent"] = safediv(
+                data["e_zeta"], safenorm(data["e_zeta"], axis=-1)[:, None]
+            )
+            return data
+        return self._curve.compute(
+            self._data_keys, grid=self._eval_grid, basis="rpz", params=params
+        )
 
     def compute(self, *params, constants=None):
         """Compute Bxdl error on curve.
@@ -3068,8 +3114,8 @@ class Bxdl(_Objective):
         if self._curve_fixed:
             eval_data = constants["eval_data"]
         else:
-            eval_data = self._curve.compute(
-                self._data_keys, grid=self._eval_grid, basis="rpz", params=curve_params
+            eval_data = self._compute_eval_data(
+                curve_params, constants["eval_transforms"]
             )
         x = jnp.array([eval_data["R"], eval_data["phi"], eval_data["Z"]]).T
 
@@ -3989,7 +4035,10 @@ class ToroidalFlux(_Objective):
     eval_grid : Grid, optional
         Collocation grid containing the nodes to evaluate the normal magnetic field at
         plasma geometry at. Defaults to a LinearGrid(L=eq.L_grid, M=eq.M_grid,
-        zeta=jnp.array(0.0), NFP=eq.NFP).
+        zeta=jnp.array(0.0), NFP=eq.NFP). For a FourierRZCuspedSurface, defaults to
+        3*eq.M+1 Gauss-Legendre nodes in θ on each of the two smooth branches
+        between the cusps, [-π/2, π/2] and [π/2, 3π/2], at ζ=0, since the integrand
+        jumps at the cusps and an equally spaced grid converges only as O(1/M).
     field_fixed : bool
         Whether to fix the field's DOFs during the optimization.
     eq_fixed : bool
@@ -4106,7 +4155,15 @@ class ToroidalFlux(_Objective):
                 "calculated from the field, however the field cannot calculate "
                 f"the vector potential, encountered error {e}",
             )
-        if self._eval_grid is None:
+        if self._eval_grid is None and isinstance(eq, FourierRZCuspedSurface):
+            # Gauss-Legendre on each branch between the cusps at θ = ±π/2
+            x, w = np.polynomial.legendre.leggauss(3 * eq.M + 1)
+            theta = np.concatenate([x, x + 2]) * np.pi / 2
+            nodes = np.array([np.ones_like(theta), theta, np.zeros_like(theta)]).T
+            spacing = np.ones_like(nodes)
+            spacing[:, 1] = np.concatenate([w, w]) * np.pi / 2
+            self._eval_grid = Grid(nodes, spacing=spacing, sort=False, NFP=eq.NFP)
+        elif self._eval_grid is None:
             eval_grid = LinearGrid(
                 L=eq.L_grid if not self._use_vector_potential else 0,
                 M=eq.M_grid if hasattr(eq, "M_grid") else 3 * eq.M,

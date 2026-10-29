@@ -17,6 +17,7 @@ __all__ = [
     "PowerSeries",
     "FourierSeries",
     "DoubleFourierSeries",
+    "CuspedDoubleFourierSeries",
     "ZernikePolynomial",
     "ChebyshevDoubleFourierBasis",
     "FourierZernikeBasis",
@@ -729,6 +730,84 @@ class DoubleFourierSeries(_Basis):
             self._sym = sym if sym is not None else self.sym
             self._modes = self._get_modes(self.M, self.N)
             self._set_up()
+
+
+class CuspedDoubleFourierSeries(DoubleFourierSeries):
+    """2D Double Fourier series with a piecewise linear poloidal angle remapping.
+
+    The poloidal angle θ of the evaluation nodes is mapped to a new angle θ' before
+    evaluating the standard double Fourier series, with
+
+    * θ ∈ [-π/2, π/2]  →  θ' = θ/2       ∈ [-π/4, π/4]
+    * θ ∈ (π/2, 3π/2)  →  θ' = θ/2 + π/2 ∈ (3π/4, 5π/4)
+
+    so that θ' jumps discontinuously at θ = ±π/2 and the m=1 mode behaves like an
+    m=1/2 mode in θ. Derivatives with respect to θ pick up a factor of (1/2)^k.
+    The mapping commutes with θ → -θ, so stellarator symmetry is preserved.
+
+    Parameters
+    ----------
+    M : int
+        Maximum poloidal resolution.
+    N : int
+        Maximum toroidal resolution.
+    NFP : int
+        Number of field periods.
+    sym : {``'cos'``, ``'sin'``, ``False``}
+        * ``'cos'`` for cos(m*t-n*z) symmetry
+        * ``'sin'`` for sin(m*t-n*z) symmetry
+        * ``False`` for no symmetry (Default)
+
+    """
+
+    # mapped angle is not uniformly spaced, so fft in theta is not valid
+    _fft_poloidal = False
+
+    @staticmethod
+    def map_theta(theta):
+        """Map evaluation poloidal angle θ to the angle θ' passed to the basis.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Poloidal angle(s) of the evaluation nodes.
+
+        Returns
+        -------
+        theta_mapped : ndarray
+            Mapped poloidal angle(s), in [0, 2π).
+
+        """
+        t = jnp.mod(theta, 2 * jnp.pi)
+        return jnp.where(
+            t <= jnp.pi / 2,
+            t / 2,
+            jnp.where(t < 3 * jnp.pi / 2, t / 2 + jnp.pi / 2, t / 2 + jnp.pi),
+        )
+
+    def evaluate(self, grid, derivatives=np.array([0, 0, 0]), modes=None):
+        """Evaluate basis functions at specified nodes.
+
+        Parameters
+        ----------
+        grid : Grid or ndarray of float, size(num_nodes,3)
+            Node coordinates, in (rho,theta,zeta).
+        derivatives : ndarray of int, shape(num_derivatives,3)
+            Order of derivatives to compute in (rho,theta,zeta).
+        modes : ndarray of in, shape(num_modes,3), optional
+            Basis modes to evaluate (if None, full basis is used).
+
+        Returns
+        -------
+        y : ndarray, shape(num_nodes,num_modes)
+            Basis functions evaluated at nodes.
+
+        """
+        nodes = grid.nodes if isinstance(grid, _Grid) else grid
+        nodes = jnp.asarray(nodes)
+        nodes = nodes.at[:, 1].set(self.map_theta(nodes[:, 1]))
+        y = super().evaluate(nodes, derivatives, modes)
+        return y * 0.5 ** derivatives[1]
 
 
 class ZernikePolynomial(_Basis):

@@ -8,6 +8,7 @@ from desc.backend import jnp
 from desc.basis import (
     ChebyshevDoubleFourierBasis,
     ChebyshevPolynomial,
+    CuspedDoubleFourierSeries,
     DoubleChebyshevFourierBasis,
     DoubleFourierSeries,
     FourierSeries,
@@ -422,6 +423,9 @@ class TestBasis:
         all_bases.append([PowerSeries(L=3), PowerSeries(L=3)])
         all_bases.append([FourierSeries(N=3), FourierSeries(N=3)])
         all_bases.append([DoubleFourierSeries(M=3, N=3), DoubleFourierSeries(M=3, N=3)])
+        all_bases.append(
+            [CuspedDoubleFourierSeries(M=3, N=3), CuspedDoubleFourierSeries(M=3, N=3)]
+        )
         all_bases.append([ZernikePolynomial(L=3, M=3), ZernikePolynomial(L=3, M=3)])
         all_bases.append(
             [FourierZernikeBasis(L=3, M=3, N=3), FourierZernikeBasis(L=3, M=3, N=3)]

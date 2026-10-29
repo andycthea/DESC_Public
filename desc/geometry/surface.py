@@ -15,7 +15,11 @@ from desc.backend import (
     sign,
     vmap,
 )
-from desc.basis import DoubleFourierSeries, ZernikePolynomial
+from desc.basis import (
+    CuspedDoubleFourierSeries,
+    DoubleFourierSeries,
+    ZernikePolynomial,
+)
 from desc.compute import get_transforms
 from desc.grid import Grid, LinearGrid
 from desc.io import InputReader
@@ -35,7 +39,11 @@ from desc.utils import (
 
 from .core import Surface
 
-__all__ = ["FourierRZToroidalSurface", "ZernikeRZToroidalSection"]
+__all__ = [
+    "FourierRZToroidalSurface",
+    "FourierRZCuspedSurface",
+    "ZernikeRZToroidalSection",
+]
 
 
 class FourierRZToroidalSurface(Surface):
@@ -77,6 +85,8 @@ class FourierRZToroidalSurface(Surface):
         "_rho",
     ]
     _static_attrs = Surface._static_attrs + ["_NFP", "_R_basis", "_Z_basis"]
+    # basis class used for R and Z
+    _basis_class = DoubleFourierSeries
 
     @execute_on_cpu
     def __init__(
@@ -137,10 +147,10 @@ class FourierRZToroidalSurface(Surface):
             else:
                 sym = False
 
-        self._R_basis = DoubleFourierSeries(
+        self._R_basis = self._new_basis(
             M=self._M, N=self._N, NFP=NFP, sym="cos" if sym else False
         )
-        self._Z_basis = DoubleFourierSeries(
+        self._Z_basis = self._new_basis(
             M=self._M, N=self._N, NFP=NFP, sym="sin" if sym else False
         )
 
@@ -160,6 +170,10 @@ class FourierRZToroidalSurface(Surface):
             assert self._compute_orientation() == 1
 
         self.name = name
+
+    def _new_basis(self, M, N, NFP, sym):
+        """Create a basis for R or Z."""
+        return self._basis_class(M=M, N=N, NFP=NFP, sym=sym)
 
     @property
     def NFP(self):
@@ -513,8 +527,8 @@ class FourierRZToroidalSurface(Surface):
 
         R = coords[:, 0]
         Z = coords[:, 2]
-        R_basis = DoubleFourierSeries(M=M, N=N, NFP=NFP, sym="cos" if sym else False)
-        Z_basis = DoubleFourierSeries(M=M, N=N, NFP=NFP, sym="sin" if sym else False)
+        R_basis = cls._basis_class(M=M, N=N, NFP=NFP, sym="cos" if sym else False)
+        Z_basis = cls._basis_class(M=M, N=N, NFP=NFP, sym="sin" if sym else False)
         if w is None:  # unweighted fit
             transform = Transform(
                 nodes, R_basis, build=False, build_pinv=True, rcond=rcond
@@ -836,6 +850,271 @@ class FourierRZToroidalSurface(Surface):
         scales.update(get_ess_scale(modes, alpha, order, min_value))
 
         return scales
+
+
+class FourierRZCuspedSurface(FourierRZToroidalSurface):
+    """Stellarator symmetric toroidal surface with two symmetric poloidal cusps.
+
+    Same as FourierRZToroidalSurface, except that R and Z are represented with a
+    CuspedDoubleFourierSeries, which maps the poloidal angle θ of the evaluation
+    grid to the angle θ' passed to the Fourier basis as
+
+    * θ ∈ [-π/2, π/2]  →  θ' = θ/2       ∈ [-π/4, π/4]
+    * θ ∈ (π/2, 3π/2)  →  θ' = θ/2 + π/2 ∈ (3π/4, 5π/4)
+
+    The jump in θ' at θ = ±π/2 produces two cusps (located symmetrically above and
+    below the midplane), and the m=1 mode effectively acts like an m=1/2 mode.
+
+    Note that the surface is only continuous across the cusps if
+    R(θ'=π/4) = R(θ'=3π/4) and Z(θ'=π/4) = Z(θ'=3π/4) for all ζ, which is not
+    enforced by this class. See ``cusp_jump``.
+
+    Parameters
+    ----------
+    R_lmn, Z_lmn : array-like, shape(k,)
+        Fourier coefficients for R and Z in cylindrical coordinates
+    modes_R : array-like, shape(k,2)
+        poloidal and toroidal mode numbers [m,n] for R_lmn.
+    modes_Z : array-like, shape(k,2)
+        mode numbers associated with Z_lmn, defaults to modes_R
+    NFP : int
+        number of field periods
+    sym : bool
+        Must be True (or "auto"); this surface is always stellarator symmetric.
+        Non-symmetric modes will be truncated.
+    M, N: int or None
+        Maximum poloidal and toroidal mode numbers. Defaults to maximum from modes_R
+        and modes_Z.
+    rho : float [0,1]
+        flux surface label for the toroidal surface
+    name : str
+        name for this surface
+    check_orientation : bool
+        ensure that this surface has a right handed orientation. Do not set to False
+        unless you are sure the parameterization you have given is right handed
+        (ie, e_theta x e_zeta points outward from the surface).
+
+    """
+
+    _basis_class = CuspedDoubleFourierSeries
+
+    @execute_on_cpu
+    def __init__(
+        self,
+        R_lmn=None,
+        Z_lmn=None,
+        modes_R=None,
+        modes_Z=None,
+        NFP=1,
+        sym=True,
+        M=None,
+        N=None,
+        rho=1,
+        name="",
+        check_orientation=True,
+    ):
+        errorif(
+            sym not in [True, "auto"],
+            ValueError,
+            f"{self.__class__.__name__} must be stellarator symmetric, got sym={sym}",
+        )
+        super().__init__(
+            R_lmn=R_lmn,
+            Z_lmn=Z_lmn,
+            modes_R=modes_R,
+            modes_Z=modes_Z,
+            NFP=NFP,
+            sym=True,
+            M=M,
+            N=N,
+            rho=rho,
+            name=name,
+            check_orientation=check_orientation,
+        )
+
+    @execute_on_cpu
+    def change_resolution(self, *args, **kwargs):
+        """Change the maximum poloidal and toroidal resolution."""
+        sym = kwargs.get("sym", None)
+        errorif(
+            sym is not None and not sym,
+            ValueError,
+            f"{self.__class__.__name__} must be stellarator symmetric, got sym={sym}",
+        )
+        super().change_resolution(*args, **kwargs)
+
+    @classmethod
+    def from_smooth_surface(  # noqa: C901
+        cls, surface, delta=np.pi / 8, M=None, N=None, ntheta=None, nzeta=None
+    ):
+        """Create a cusped surface from a smooth stellarator symmetric surface.
+
+        At each toroidal angle ζ, the smooth boundary is replaced within a window
+        θ ∈ [θ₀ - δ, θ₀ + δ] around θ₀ = π/2 and θ₀ = 3π/2 by the two lines tangent
+        to the smooth boundary at θ₀ ± δ, which meet in a sharp corner (the cusp)
+        near the θ₀ point of the smooth boundary. Larger ``delta`` gives a sharper
+        cusp that deviates further from the original surface. Outside these windows
+        the new surface follows the smooth one, with the same poloidal angle θ.
+
+        The resulting curve is then fit with a CuspedDoubleFourierSeries. The parts of
+        the basis angle θ' that are never evaluated, θ' ∈ (π/4, 3π/4) ∪ (5π/4, 7π/4),
+        are filled with a cubic Hermite interpolant that matches the value and
+        one-sided slopes at the cusp, so the fitted surface is continuous across
+        the cusps (up to the fit error) and the Fourier coefficients converge well.
+
+        Parameters
+        ----------
+        surface : FourierRZToroidalSurface
+            Smooth stellarator symmetric surface to create the cusped surface from.
+            Its toroidal angle ζ is assumed to be the cylindrical angle φ.
+        delta : float
+            Half-width in θ of the window around θ = π/2 and θ = 3π/2 that is
+            replaced by the tangent lines. Must be in (0, π/2).
+        M, N : int, optional
+            Poloidal and toroidal resolution of the cusped surface. Defaults to
+            max(4*surface.M, 16) and surface.N. The basis angle is θ/2, and the
+            corners where the tangent lines meet the smooth surface limit the fit
+            convergence to roughly O(M⁻²), so M should be well above surface.M.
+        ntheta, nzeta : int, optional
+            Number of points in θ' (over [0, 2π)) and ζ (over one field period) used
+            for the fit. Defaults to 8*(M+1) and 4*N+1.
+
+        Returns
+        -------
+        surf : FourierRZCuspedSurface
+            Cusped surface fit to the modified boundary.
+
+        """
+        errorif(
+            not surface.sym,
+            ValueError,
+            "surface must be stellarator symmetric to create a cusped surface.",
+        )
+        errorif(
+            not (0 < delta < np.pi / 2),
+            ValueError,
+            f"delta must be in (0, pi/2), got {delta}.",
+        )
+        M = check_nonnegint(M, "M")
+        N = check_nonnegint(N, "N")
+        M = max(4 * surface.M, 16) if M is None else M
+        N = surface.N if N is None else N
+        NFP = surface.NFP
+        ntheta = 8 * (M + 1) if ntheta is None else ntheta
+        nzeta = 4 * N + 1 if nzeta is None else nzeta
+
+        zeta = np.linspace(0, 2 * np.pi / NFP, nzeta, endpoint=False)
+        tp = np.linspace(0, 2 * np.pi, ntheta, endpoint=False)  # basis angle θ'
+
+        def _eval(theta, zeta, keys):
+            theta, zeta = np.broadcast_arrays(theta, zeta)
+            nodes = np.array([np.ones(theta.size), theta.ravel(), zeta.ravel()]).T
+            data = surface.compute(keys, grid=Grid(nodes, sort=False, jitable=True))
+            return [np.asarray(data[k]).reshape(theta.shape) for k in keys]
+
+        # one entry per cusp, ordered as (θ₀, start of θ' gap)
+        cusps = [(np.pi / 2, np.pi / 4), (3 * np.pi / 2, 5 * np.pi / 4)]
+        corners = []
+        for theta0, _ in cusps:
+            # tangent lines at θ₀ ± δ in the R-Z plane, at each ζ
+            R, Z, R_t, Z_t = _eval(
+                np.array([theta0 - delta, theta0 + delta])[:, None],
+                zeta[None, :],
+                ["R", "Z", "R_t", "Z_t"],
+            )
+            P1, P2 = np.stack([R, Z], axis=-1)  # shape(nzeta, 2)
+            T1, T2 = np.stack([R_t, Z_t], axis=-1)
+            # solve P1 + a*T1 = P2 - b*T2 for a, b
+            A = np.stack([T1, T2], axis=-1)  # shape(nzeta, 2, 2)
+            a, b = np.linalg.solve(A, (P2 - P1)[..., None])[..., 0].T
+            if np.any(a <= 0) or np.any(b <= 0):
+                warnings.warn(
+                    f"Tangent lines around theta={theta0:.4f} do not intersect "
+                    "outside the surface for all zeta; the boundary may be concave "
+                    "there. Try a different delta."
+                )
+            C = P1 + a[:, None] * T1
+            corners.append((P1, C, P2))
+
+        # map θ' back to the eval angle θ, and mark the unused gaps in θ'
+        theta = np.where(tp <= np.pi / 4, 2 * tp, 2 * tp - np.pi)
+        theta = np.where(tp >= 7 * np.pi / 4, 2 * tp - 2 * np.pi, theta)
+        theta = np.mod(theta, 2 * np.pi)
+        in_gap = ((tp > np.pi / 4) & (tp < 3 * np.pi / 4)) | (
+            (tp > 5 * np.pi / 4) & (tp < 7 * np.pi / 4)
+        )
+
+        # target values on the (θ', ζ) grid, shape(ntheta, nzeta, 2)
+        R, Z = _eval(theta[:, None], zeta[None, :], ["R", "Z"])
+        X = np.stack([R, Z], axis=-1)
+        for (theta0, gap0), (P1, C, P2) in zip(cusps, corners):
+            # straight segments P1 -> C -> P2, linear in θ
+            s = (theta - theta0)[:, None, None] / delta
+            left = (s >= -1) & (s <= 0) & ~in_gap[:, None, None]
+            right = (s > 0) & (s <= 1) & ~in_gap[:, None, None]
+            X = np.where(left, C + s * (C - P1), X)
+            X = np.where(right, C + s * (P2 - C), X)
+            # cubic Hermite fill of the gap, matching value and one-sided slopes
+            # (dX/dθ' = 2 dX/dθ) at both ends; the value is C at both ends
+            h = np.pi / 2
+            u = ((tp - gap0) / h)[:, None, None]
+            m0 = 2 * (C - P1) / delta
+            m1 = 2 * (P2 - C) / delta
+            fill = C + h * (u**3 - 2 * u**2 + u) * m0 + h * (u**3 - u**2) * m1
+            mask = (tp > gap0) & (tp < gap0 + h)
+            X = np.where(mask[:, None, None], fill, X)
+
+        # least squares fit in θ' with the standard (unmapped) basis
+        tt, zz = np.meshgrid(tp, zeta, indexing="ij")
+        nodes = np.array([np.ones(tt.size), tt.ravel(), zz.ravel()]).T
+        R_basis = DoubleFourierSeries(M=M, N=N, NFP=NFP, sym="cos")
+        Z_basis = DoubleFourierSeries(M=M, N=N, NFP=NFP, sym="sin")
+        R_lmn = np.linalg.lstsq(
+            np.asarray(R_basis.evaluate(nodes)), X[..., 0].ravel(), rcond=None
+        )[0]
+        Z_lmn = np.linalg.lstsq(
+            np.asarray(Z_basis.evaluate(nodes)), X[..., 1].ravel(), rcond=None
+        )[0]
+
+        return cls(
+            R_lmn,
+            Z_lmn,
+            R_basis.modes[:, 1:],
+            Z_basis.modes[:, 1:],
+            NFP,
+            True,
+            check_orientation=False,
+            name=surface.name,
+        )
+
+    def cusp_jump(self, zeta=None):
+        """Jump in (R, Z) across the cusp at θ = π/2 (and by symmetry θ = -π/2).
+
+        Parameters
+        ----------
+        zeta : array-like, optional
+            Toroidal angles to evaluate at. Defaults to 4N+1 points in one
+            field period.
+
+        Returns
+        -------
+        dR, dZ : ndarray, shape(len(zeta),)
+            R(θ'=3π/4) - R(θ'=π/4) and Z(θ'=3π/4) - Z(θ'=π/4). These are zero when
+            the surface is continuous across the cusps.
+
+        """
+        if zeta is None:
+            zeta = np.linspace(0, 2 * np.pi / self.NFP, 4 * self.N + 1, endpoint=False)
+        zeta = np.atleast_1d(zeta)
+        # evaluate the underlying (unmapped) Fourier series on either side of the cusp
+        out = []
+        for basis, x in zip([self.R_basis, self.Z_basis], [self.R_lmn, self.Z_lmn]):
+            vals = []
+            for tp in [jnp.pi / 4, 3 * jnp.pi / 4]:
+                nodes = jnp.array([jnp.ones_like(zeta), tp * jnp.ones_like(zeta), zeta])
+                vals.append(DoubleFourierSeries.evaluate(basis, nodes.T) @ x)
+            out.append(vals[1] - vals[0])
+        return tuple(out)
 
 
 class ZernikeRZToroidalSection(Surface):

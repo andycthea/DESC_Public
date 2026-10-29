@@ -92,6 +92,7 @@ from .linear_objectives import (
     FixCurrent,
     FixCurveRotation,
     FixCurveShift,
+    FixCuspContinuity,
     FixElectronDensity,
     FixElectronTemperature,
     FixElectronTemperatureShape,

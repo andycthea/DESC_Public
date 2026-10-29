@@ -19,8 +19,8 @@ from desc.backend import (
     tree_map_with_path,
     tree_structure,
 )
-from desc.basis import zernike_radial
-from desc.geometry import FourierRZCurve
+from desc.basis import fourier, zernike_radial
+from desc.geometry import FourierRZCurve, FourierRZCuspedSurface
 from desc.utils import broadcast_tree, errorif, setdefault
 
 from .normalization import compute_scaling_factors
@@ -2309,6 +2309,123 @@ class FixCurrent(FixParameters):
             scales = compute_scaling_factors(eq)
             self._normalization = scales["I"]
         super().build(use_jit=use_jit, verbose=verbose)
+
+
+class FixCuspContinuity(_Objective):
+    """Enforce that the two branches of a FourierRZCuspedSurface meet at the cusps.
+
+    A FourierRZCuspedSurface evaluates its Fourier series at the basis angle θ',
+    which jumps from π/4 to 3π/4 at the cusp at θ = π/2 (and, by stellarator
+    symmetry, from 5π/4 to 7π/4 at θ = 3π/2). The surface is closed with
+    intersecting cusps only if R(θ'=π/4, ζ) = R(θ'=3π/4, ζ) and
+    Z(θ'=π/4, ζ) = Z(θ'=3π/4, ζ) for all ζ.
+
+    Since R = Σ R_mn F_m(θ') G_n(ζ) and the G_n are linearly independent, this is
+    equivalent to Σ_m R_mn [F_m(3π/4) - F_m(π/4)] = 0 for each toroidal mode n
+    (and similarly for Z). Only odd m cos modes in R and m ≡ 2 (mod 4) sin modes in
+    Z enter these sums.
+
+    Parameters
+    ----------
+    surface : FourierRZCuspedSurface
+        Cusped surface that will be optimized to satisfy the Objective.
+    normalize : bool, optional
+        Whether to compute the error in physical units or non-dimensionalize.
+    name : str, optional
+        Name of the objective function.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        overwrite={
+            "target": "",
+            "bounds": "",
+            "normalize_target": "",
+            "weight": "",
+        }
+    )
+    _scalar = False
+    _linear = True
+    _fixed = False  # not "diagonal", since it is fixing a sum
+    _units = "(m)"
+    _print_value_fmt = "Cusp continuity error: "
+
+    def __init__(self, surface, normalize=True, name="cusp continuity"):
+        errorif(
+            not isinstance(surface, FourierRZCuspedSurface),
+            TypeError,
+            f"FixCuspContinuity requires a FourierRZCuspedSurface, got {surface}",
+        )
+        super().__init__(
+            things=surface,
+            target=0,
+            bounds=None,
+            weight=1,
+            normalize=normalize,
+            normalize_target=normalize,
+            name=name,
+        )
+
+    @execute_on_cpu
+    def build(self, use_jit=False, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        surface = self.things[0]
+
+        def _jump_matrix(basis):
+            m, n = basis.modes[:, 1], basis.modes[:, 2]
+            # jump in the poloidal basis function across the cusp
+            c = np.asarray(
+                fourier(np.array([[3 * np.pi / 4]]), m)
+                - fourier(np.array([[np.pi / 4]]), m)
+            )[0]
+            c = np.where(np.abs(c) < 1e-12, 0, c)
+            # one row per toroidal mode n, skipping rows with no contributing modes
+            rows = [
+                np.where(n == nn, c, 0)
+                for nn in np.unique(n)
+                if np.any(c[n == nn] != 0)
+            ]
+            return np.array(rows).reshape(-1, basis.num_modes)
+
+        self._A_R = _jump_matrix(surface.R_basis)
+        self._A_Z = _jump_matrix(surface.Z_basis)
+        self._dim_f = self._A_R.shape[0] + self._A_Z.shape[0]
+
+        if self._normalize:
+            scales = compute_scaling_factors(surface)
+            self._normalization = scales["a"]
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, params, constants=None):
+        """Compute cusp continuity errors.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary of surface degrees of freedom, eg Surface.params_dict
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants. (Deprecated)
+
+        Returns
+        -------
+        f : ndarray
+            Jump in the coefficients of each toroidal mode of R and Z across the
+            cusp at θ = π/2.
+
+        """
+        return jnp.concatenate(
+            [jnp.dot(self._A_R, params["R_lmn"]), jnp.dot(self._A_Z, params["Z_lmn"])]
+        )
 
 
 class FixElectronTemperature(FixParameters):
