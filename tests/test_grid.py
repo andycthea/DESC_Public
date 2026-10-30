@@ -5,6 +5,7 @@ import pytest
 from scipy import special
 
 from desc.equilibrium import Equilibrium
+from desc.basis import FourierZernikeBasis
 from desc.examples import get
 from desc.grid import (
     ConcentricGrid,
@@ -13,6 +14,7 @@ from desc.grid import (
     LinearGrid,
     LinearGridOffset,
     QuadratureGrid,
+    QuadratureGridOffset,
     dec_to_cf,
     find_least_rational_surfaces,
     find_most_rational_surfaces,
@@ -469,26 +471,41 @@ class TestGrid:
             (np.arange(2 * N + 3) + 0.5) * 2 * np.pi / ((2 * N + 3) * NFP),
         )
 
-        # transforms with the fft method match the direct method
-        from desc.basis import FourierZernikeBasis
-
-        g = LinearGridOffset(L, M, N, NFP)
-        basis = FourierZernikeBasis(L=2, M=2, N=N, NFP=NFP)
-        c = np.random.default_rng(0).normal(size=basis.num_modes)
-        for d in [[0, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 2]]:
-            f_fft = Transform(g, basis, derivs=1 + max(d), method="fft")
-            f_dir = Transform(g, basis, derivs=1 + max(d), method="direct1")
-            assert f_fft.method == "fft"
-            np.testing.assert_allclose(
-                f_fft.transform(c, *d), f_dir.transform(c, *d), atol=1e-12
-            )
-
         with pytest.raises(ValueError):
             LinearGridOffset(M=M, zeta=np.array([0.1, 0.2]))
         with pytest.raises(ValueError):
             LinearGridOffset(M=M)
         with pytest.raises(ValueError):
             LinearGridOffset(M=M, N=N, endpoint=True)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "grid",
+        [
+            LinearGridOffset(2, 3, 4, 3),
+            LinearGridOffset(2, 3, 4, 3, sym=True),
+            LinearGridOffset(L=2, M=3, zeta=10, NFP=3),  # even, oversampled
+            QuadratureGridOffset(4, 3, 4, 3),
+            QuadratureGridOffset(4, 3, 6, 3),  # oversampled
+        ],
+    )
+    def test_offset_grid_fft_transform(self, grid):
+        """Test fft transform, project and fit on offset grids against direct1."""
+        assert not grid.fft_toroidal
+        basis = FourierZernikeBasis(L=2, M=2, N=4, NFP=grid.NFP)
+        f_fft = Transform(grid, basis, derivs=3, method="fft", build_pinv=True)
+        f_dir = Transform(grid, basis, derivs=3, method="direct1", build_pinv=True)
+        assert f_fft.method == "fft"
+        rng = np.random.default_rng(0)
+        c = rng.normal(size=basis.num_modes)
+        for d in [[0, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 2], [1, 1, 1]]:
+            np.testing.assert_allclose(
+                f_fft.transform(c, *d), f_dir.transform(c, *d), atol=1e-11
+            )
+        y = rng.normal(size=grid.num_nodes)
+        np.testing.assert_allclose(f_fft.project(y), f_dir.project(y), atol=1e-11)
+        x = f_dir.transform(c)
+        np.testing.assert_allclose(f_fft.fit(x), f_dir.fit(x), atol=1e-8)
 
     @pytest.mark.unit
     def test_concentric_grid(self):

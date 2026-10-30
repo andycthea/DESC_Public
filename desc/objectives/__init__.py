@@ -26,6 +26,7 @@ from ._coils import (
     CoilChargeTime,
     CurveToCurveDist,
     CoilCurrentLengthSum,
+    XLineRho,
 )
 from ._equilibrium import (
     CurrentDensity,

@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 from scipy.constants import mu_0
 
-from desc.backend import jax, jnp
+from desc.backend import fori_loop, jax, jnp
 from desc.backend import tree_broadcast as jax_tree_broadcast
 from desc.backend import tree_flatten, tree_leaves, tree_map, tree_unflatten
 from desc.batching import vmap_chunked
@@ -4128,6 +4128,250 @@ class CurveToCurveDist(_Objective):
 
 
 
+
+
+class XLineRho(_Objective):
+    """Target the continued radial coordinate rho of a curve, e.g. an X-line.
+
+    DESC's Fourier-Zernike representation is polynomial in rho, so the equilibrium
+    coordinates can be evaluated past the boundary (rho > 1). For each point on the
+    curve this objective solves (R, Z)(rho, theta, zeta=phi) = (R_x, Z_x) for
+    (rho, theta) without restricting rho <= 1, and returns rho. Since rho^2 is the
+    normalized toroidal flux, ``target=1/sqrt(f)`` asks for the plasma boundary to
+    enclose a fraction ``f`` of the flux inside the curve (e.g. f = 0.95 -> 1.026).
+
+    The inverse map is found with a fixed number of Newton iterations that are not
+    differentiated through. A final Newton step is taken with the live parameters,
+    which gives the exact first derivative at convergence (implicit function theorem).
+    Assumes phi = zeta (omega = 0).
+
+    Note that the polynomial continuation is smooth, while the true flux surfaces
+    flare out near an X-point (flux expansion). The continued rho of an X-line is
+    therefore larger than its true flux label, so treat the target as calibrated
+    (e.g. against field line tracing) rather than as the true flux fraction.
+
+    Parameters
+    ----------
+    eq : Equilibrium
+        Equilibrium whose (continued) flux coordinates are used.
+    curve : Curve
+        Curve, e.g. an X-line, to locate in the equilibrium's coordinates.
+    grid : Grid or int, optional
+        Collocation grid on the curve. If an integer, uses ``LinearGrid(N=grid)``.
+        Defaults to ``LinearGrid(N=2 * curve.N + 5)``.
+    eq_fixed : bool, optional
+        Whether the equilibrium is fixed in the optimization. Default is False.
+    curve_fixed : bool, optional
+        Whether the curve is fixed in the optimization. Default is False.
+    n_newton : int, optional
+        Number of Newton iterations for the inverse map. Default is 20.
+    n_theta_guess : int, optional
+        Number of theta points on rho=1 searched for the initial guess. Default 64.
+    max_rho_step : float, optional
+        Maximum change in rho per Newton iteration. Default is 0.05.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``target=1``.",
+        bounds_default="``target=1``.",
+    )
+
+    _scalar = False
+    _linear = False
+    _units = "(~)"
+    _print_value_fmt = "Curve continued rho: "
+
+    _static_attrs = _Objective._static_attrs + [
+        "_eq_fixed",
+        "_curve_fixed",
+        "_n_newton",
+        "_max_rho_step",
+    ]
+
+    def __init__(
+        self,
+        eq,
+        curve,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        name="curve continued rho",
+        jac_chunk_size=None,
+        *,
+        eq_fixed=False,
+        curve_fixed=False,
+        n_newton=20,
+        n_theta_guess=64,
+        max_rho_step=0.05,
+    ):
+        if target is None and bounds is None:
+            target = 1
+        errorif(
+            eq_fixed and curve_fixed,
+            ValueError,
+            "Cannot have both `eq_fixed` and `curve_fixed` set to True.",
+        )
+        self._eq = eq
+        self._curve = curve
+        self._grid = grid
+        self._eq_fixed = eq_fixed
+        self._curve_fixed = curve_fixed
+        self._n_newton = n_newton
+        self._n_theta_guess = n_theta_guess
+        self._max_rho_step = max_rho_step
+        things = []
+        if not eq_fixed:
+            things += [eq]
+        if not curve_fixed:
+            things += [curve]
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        curve = self._curve
+        grid = self._grid
+        if grid is None:
+            grid = LinearGrid(N=2 * curve.N + 5)
+        if isinstance(grid, numbers.Integral):
+            grid = LinearGrid(N=grid)
+        self._grid = grid
+        self._dim_f = grid.num_nodes
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+        with warnings.catch_warnings():
+            # grid spans the full torus, so its NFP need not match the curve's
+            warnings.filterwarnings("ignore", message="Unequal number of field periods")
+            curve_transforms = get_transforms("x", obj=curve, grid=grid)
+        self._constants = {
+            "curve_transforms": curve_transforms,
+            "theta_guess": jnp.linspace(
+                0, 2 * np.pi, self._n_theta_guess, endpoint=False
+            ),
+            "quad_weights": 1.0,
+        }
+        if self._eq_fixed:
+            self._constants["eq_params"] = {
+                k: jnp.asarray(self._eq.params_dict[k]) for k in ("R_lmn", "Z_lmn")
+            }
+        if self._curve_fixed:
+            self._constants["curve_params"] = curve.params_dict
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        # rho is already dimensionless
+        self._normalization = 1
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def _rz(self, eq_params, nodes, dr=0, dt=0):
+        """R, Z (or their rho/theta derivatives) at arbitrary (rho, theta, zeta)."""
+        d = np.array([dr, dt, 0])
+        R = self._eq.R_basis.evaluate(nodes, derivatives=d) @ eq_params["R_lmn"]
+        Z = self._eq.Z_basis.evaluate(nodes, derivatives=d) @ eq_params["Z_lmn"]
+        return R, Z
+
+    def _newton_step(self, eq_params, rho, theta, phi, R_x, Z_x):
+        """Newton step for (R, Z)(rho, theta, phi) = (R_x, Z_x)."""
+        nodes = jnp.column_stack([rho, theta, phi])
+        R, Z = self._rz(eq_params, nodes)
+        R_r, Z_r = self._rz(eq_params, nodes, dr=1)
+        R_t, Z_t = self._rz(eq_params, nodes, dt=1)
+        F_R, F_Z = R - R_x, Z - Z_x
+        det = R_r * Z_t - R_t * Z_r
+        d_rho = -(Z_t * F_R - R_t * F_Z) / det
+        d_theta = -(-Z_r * F_R + R_r * F_Z) / det
+        return d_rho, d_theta
+
+    def compute(self, *params, constants=None):
+        """Compute the continued rho of each curve point.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionaries of the equilibrium's and/or the curve's degrees of freedom,
+            in that order, omitting whichever is fixed.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants
+
+        Returns
+        -------
+        f : ndarray
+            Continued rho at each curve node.
+
+        """
+        if constants is None:
+            constants = self._constants
+        params = list(params)
+        eq_params = constants["eq_params"] if self._eq_fixed else params.pop(0)
+        curve_params = constants["curve_params"] if self._curve_fixed else params.pop(0)
+
+        x = self._curve.compute(
+            "x",
+            grid=self._grid,
+            params=curve_params,
+            transforms=constants["curve_transforms"],
+            basis="rpz",
+        )["x"]
+        R_x, phi_x, Z_x = x.T
+
+        # the Newton solve is not differentiated through
+        sg = jax.lax.stop_gradient
+        p_sg = sg({k: eq_params[k] for k in ("R_lmn", "Z_lmn")})
+        R_sg, phi_sg, Z_sg = sg(R_x), sg(phi_x), sg(Z_x)
+
+        # initial guess: nearest point on the rho=1 surface in the same toroidal plane
+        th = constants["theta_guess"]
+        n, nt = R_sg.size, th.size
+        nodes0 = jnp.column_stack(
+            [jnp.ones(n * nt), jnp.tile(th, n), jnp.repeat(phi_sg, nt)]
+        )
+        R0, Z0 = self._rz(p_sg, nodes0)
+        dist = (R0 - jnp.repeat(R_sg, nt)) ** 2 + (Z0 - jnp.repeat(Z_sg, nt)) ** 2
+        y0 = (jnp.ones(n), th[jnp.argmin(dist.reshape(n, nt), axis=1)])
+
+        def body(i, y):
+            rho, theta = y
+            d_rho, d_theta = self._newton_step(p_sg, rho, theta, phi_sg, R_sg, Z_sg)
+            d_rho = jnp.clip(d_rho, -self._max_rho_step, self._max_rho_step)
+            return rho + d_rho, theta + d_theta
+
+        rho, theta = sg(fori_loop(0, self._n_newton, body, y0))
+
+        # one Newton step with the live parameters: at convergence this is the
+        # identity in value and gives the implicit-function-theorem derivative
+        d_rho, _ = self._newton_step(eq_params, rho, theta, phi_x, R_x, Z_x)
+        return rho + d_rho
 
 
 class ToroidalFlux(_Objective):
