@@ -25,6 +25,7 @@ from ._coils import (
     FieldOnCurve,
     CoilChargeTime,
     CurveToCurveDist,
+    DivertorLegDistance,
     CoilCurrentLengthSum,
     XLineRho,
 )

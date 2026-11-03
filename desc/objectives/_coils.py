@@ -4127,6 +4127,285 @@ class CurveToCurveDist(_Objective):
         return safenorm(x_1 - x_2, axis=-1)
 
 
+def _leg_curves(leg, allow_xline=False):
+    """Return (curve_start, curve_end) from a tuple or a FieldNormalError.
+
+    If ``allow_xline``, a bare Curve is treated as an X-line: (curve, None).
+    """
+    from desc.geometry import Curve
+
+    if isinstance(leg, Curve):
+        errorif(
+            not allow_xline,
+            TypeError,
+            "Free legs must be (curve_start, curve_end) pairs or FieldNormalErrors.",
+        )
+        return leg, None
+    if isinstance(leg, FieldNormalError):
+        errorif(
+            leg._curve_start is None or leg._curve_end is None,
+            ValueError,
+            "FieldNormalError legs must be built from (curve_start, curve_end).",
+        )
+        return leg._curve_start, leg._curve_end
+    errorif(
+        len(leg) != 2,
+        ValueError,
+        "Each leg must be a (curve_start, curve_end) pair or a FieldNormalError.",
+    )
+    return tuple(leg)
+
+
+class DivertorLegDistance(_Objective):
+    """Target the perpendicular distance between free and fixed divertor legs.
+
+    Uses the same divertor leg representation as ``FieldNormalError``: a leg is
+    the ruled surface between ``curve_start`` (the X-line) and ``curve_end`` (the
+    footpoint curve), so at each toroidal sample the leg is the straight line
+    ``P(v) = c_start + v * (c_end - c_start)``.
+
+    For every pair (free leg, fixed leg), every toroidal node of ``grid``, and every
+    fraction ``v`` in ``fixed_leg_fractions``, the point ``v`` along the fixed leg
+    is projected onto the (infinite) line of the free leg, and the perpendicular
+    distance between the point and that line is returned. With the default
+    ``fixed_leg_fractions=(0,)`` this is the distance from the fixed X-line to the
+    line through each free leg.
+
+    A fixed entry can also be just an X-line curve (no footpoint curve). The
+    distance is then measured from the X-line itself, and ``fixed_leg_fractions``
+    does not apply to it.
+
+    The fixed legs' geometry is computed once at build time and does not change
+    during the optimization. The curves of the free legs are optimizable; curves
+    shared between free legs (e.g. a common X-line) are only added once.
+
+    Distances are computed in Cartesian coordinates. For curves parameterized by the
+    toroidal angle (e.g. ``FourierRZCurve``), all points at a grid node lie in the
+    same poloidal plane, so this is the in-plane (R, Z) perpendicular distance.
+
+    Parameters
+    ----------
+    free_legs : list
+        Divertor legs whose curves are optimized. Each entry is either a
+        ``(curve_start, curve_end)`` pair or a ``FieldNormalError`` built from
+        curves.
+    fixed_legs : Curve or list
+        Fixed geometry, held constant during the optimization. Each entry is a
+        ``(curve_start, curve_end)`` pair, a ``FieldNormalError`` built from curves,
+        or a single ``Curve`` (a fixed X-line only). A single ``Curve`` may also be
+        passed instead of a list.
+    grid : Grid or int, optional
+        Collocation grid with the toroidal nodes the curves are evaluated at. If an
+        integer, uses ``LinearGrid(N=grid)``. Defaults to
+        ``LinearGrid(N=2 * max(curve.N) + 5)`` over all leg curves.
+    fixed_leg_fractions : array-like, optional
+        Fractions ``v`` along each fixed leg (0 = ``curve_start``,
+        1 = ``curve_end``) at which points are sampled. Ignored for fixed entries
+        that are only an X-line. Default is ``(0,)``.
+
+    """
+
+    __doc__ = __doc__.rstrip() + collect_docs(
+        target_default="``bounds=(0, np.inf)``.",
+        bounds_default="``bounds=(0, np.inf)``.",
+    )
+
+    _scalar = False
+    _linear = False
+    _units = "(m)"
+    _print_value_fmt = "Divertor leg perpendicular distance: "
+
+    _static_attrs = _Objective._static_attrs + ["_leg_idx"]
+
+    def __init__(
+        self,
+        free_legs,
+        fixed_legs,
+        target=None,
+        bounds=None,
+        weight=1,
+        normalize=True,
+        normalize_target=True,
+        loss_function=None,
+        deriv_mode="auto",
+        grid=None,
+        fixed_leg_fractions=(0.0,),
+        name="divertor leg distance",
+        jac_chunk_size=None,
+    ):
+        if target is None and bounds is None:
+            bounds = (0, np.inf)
+        self._free_legs = [_leg_curves(leg) for leg in free_legs]
+        from desc.geometry import Curve
+
+        if isinstance(fixed_legs, (Curve, FieldNormalError)):
+            fixed_legs = [fixed_legs]
+        self._fixed_legs = [_leg_curves(leg, allow_xline=True) for leg in fixed_legs]
+        errorif(len(self._free_legs) == 0, ValueError, "No free legs given.")
+        errorif(len(self._fixed_legs) == 0, ValueError, "No fixed legs given.")
+        self._grid = grid
+        self._fixed_leg_fractions = np.atleast_1d(fixed_leg_fractions).astype(float)
+
+        # unique free curves (by identity), and each free leg's indices into them
+        things = []
+        leg_idx = []
+        for leg in self._free_legs:
+            idx = []
+            for curve in leg:
+                for i, thing in enumerate(things):
+                    if thing is curve:
+                        break
+                else:
+                    things.append(curve)
+                    i = len(things) - 1
+                idx.append(i)
+            leg_idx.append(tuple(idx))
+        self._leg_idx = tuple(leg_idx)
+
+        super().__init__(
+            things=things,
+            target=target,
+            bounds=bounds,
+            weight=weight,
+            normalize=normalize,
+            normalize_target=normalize_target,
+            loss_function=loss_function,
+            deriv_mode=deriv_mode,
+            name=name,
+            jac_chunk_size=jac_chunk_size,
+        )
+
+    def build(self, use_jit=True, verbose=1):
+        """Build constant arrays.
+
+        Parameters
+        ----------
+        use_jit : bool, optional
+            Whether to just-in-time compile the objective and derivatives.
+        verbose : int, optional
+            Level of output.
+
+        """
+        all_curves = [
+            c for leg in self._free_legs + self._fixed_legs for c in leg if c is not None
+        ]
+        grid = self._grid
+        if grid is None:
+            grid = LinearGrid(N=2 * max(c.N for c in all_curves) + 5)
+        if isinstance(grid, numbers.Integral):
+            grid = LinearGrid(N=grid)
+        errorif(
+            not isinstance(grid, _Grid),
+            TypeError,
+            f"grid must be a Grid object or an integer, got type {type(grid)}",
+        )
+        errorif(
+            grid.num_rho > 1 or grid.num_theta > 1,
+            ValueError,
+            "Only use toroidal resolution for curve grids.",
+        )
+        self._grid = grid
+
+
+        timer = Timer()
+        if verbose > 0:
+            print("Precomputing transforms")
+        timer.start("Precomputing transforms")
+
+        with warnings.catch_warnings():
+            # grid may span the full torus, so its NFP need not match the curve's
+            warnings.filterwarnings("ignore", message="Unequal number of field periods")
+            transforms = [
+                get_transforms("x", obj=curve, grid=grid) for curve in self.things
+            ]
+            # fixed points in xyz, shape(n_fixed_pts, num_nodes, 3): n_v points per
+            # fixed leg (in fraction order), one per fixed X-line, in input order
+            v = self._fixed_leg_fractions[:, None, None]
+            fixed_pts = []
+            for c_start, c_end in self._fixed_legs:
+                x0 = rpz2xyz(c_start.compute("x", grid=grid, basis="rpz")["x"])
+                if c_end is None:
+                    fixed_pts.append(x0[None])
+                else:
+                    x1 = rpz2xyz(c_end.compute("x", grid=grid, basis="rpz")["x"])
+                    fixed_pts.append(x0 + v * (x1 - x0))
+            fixed_pts = jnp.asarray(np.concatenate(fixed_pts, axis=0))
+
+            if self._normalize:
+                # typical length of the free legs
+                lengths = []
+                for c_start, c_end in self._free_legs:
+                    x0 = rpz2xyz(c_start.compute("x", grid=grid, basis="rpz")["x"])
+                    x1 = rpz2xyz(c_end.compute("x", grid=grid, basis="rpz")["x"])
+                    lengths.append(np.mean(np.linalg.norm(x1 - x0, axis=-1)))
+                self._normalization = np.mean(lengths)
+
+        # output ordering: (free leg, fixed point, toroidal node)
+        self._dim_f = len(self._free_legs) * fixed_pts.shape[0] * grid.num_nodes
+
+        self._constants = {
+            "transforms": transforms,
+            "fixed_pts": fixed_pts,
+            "quad_weights": 1.0,
+        }
+
+        timer.stop("Precomputing transforms")
+        if verbose > 1:
+            timer.disp("Precomputing transforms")
+
+        super().build(use_jit=use_jit, verbose=verbose)
+
+    def compute(self, *params, constants=None):
+        """Compute perpendicular distances from fixed-leg points to free-leg lines.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionaries of the degrees of freedom of each unique free-leg curve,
+            in the order of ``self.things``.
+        constants : dict
+            Dictionary of constant data, eg transforms, profiles etc. Defaults to
+            self.constants
+
+        Returns
+        -------
+        f : ndarray
+            Perpendicular distances, flattened from shape
+            (n_free, n_fixed_pts, num_nodes). The fixed points are, in input order,
+            ``len(fixed_leg_fractions)`` points per fixed leg and one per fixed
+            X-line.
+
+        """
+        if constants is None:
+            constants = self._constants
+
+        x = [
+            rpz2xyz(
+                curve.compute(
+                    "x",
+                    grid=self._grid,
+                    params=p,
+                    transforms=t,
+                    basis="rpz",
+                )["x"]
+            )
+            for curve, p, t in zip(self.things, params, constants["transforms"])
+        ]
+        # free legs: origin and direction, shape(n_free, num_nodes, 3)
+        x0 = jnp.stack([x[i] for i, _ in self._leg_idx])
+        d = jnp.stack([x[j] for _, j in self._leg_idx]) - x0
+
+        # offsets of fixed points from free-leg origins,
+        # shape(n_free, n_fixed_pts, num_nodes, 3)
+        offset = constants["fixed_pts"][None] - x0[:, None]
+        d = d[:, None]
+        proj = jnp.sum(offset * d, axis=-1, keepdims=True) / jnp.sum(
+            d * d, axis=-1, keepdims=True
+        )
+        # flatten first: safenorm squeezes all singleton axes, not just the normed one
+        return safenorm((offset - proj * d).reshape(-1, 3), axis=-1)
+
+
 
 
 
