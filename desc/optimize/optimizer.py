@@ -491,7 +491,8 @@ def _print_output(things, things0, objective, constraints, result):
         x=objective.x(*state), x0=objective.x(*state_0), fse=fse, f0se=f0se
     )
     for con in constraints:
-        arg_inds_for_this_con = [things.index(t) for t in things if t in con.things]
+        # in the order con.things expects, which need not match the order of things
+        arg_inds_for_this_con = [things.index(t) for t in con.things]
         args_for_this_con = [things[ind] for ind in arg_inds_for_this_con]
         args0_for_this_con = [things0[ind] for ind in arg_inds_for_this_con]
         _val = con.print_value(con.xs(*args_for_this_con), con.xs(*args0_for_this_con))
